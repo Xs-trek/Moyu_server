@@ -1,0 +1,24 @@
+node_modules/
+bin/*
+!bin/README.md
+dist/
+*.log
+config.json
+.tsbuildinfo
+
+# Node.js 项目通用规范（对齐 github/gitignore Node.gitignore）
+coverage/
+.env
+.env.*
+.idea/
+*.tgz
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.DS_Store
+
+# 含本机实测网络数据的设计调研文档（不进库）
+requirements-spec.md
+research/findings.md
+test/check-codex-bin.ts

@@ -1,0 +1,129 @@
+# §3 single-binary release: cross-compiles moyu for every target EasyTier v2.6.4
+# publishes an official binary for, embedding the matching easytier-core. EasyTier's
+# official Linux archives are produced from musl Rust targets; the same unmodified
+# static core binary is therefore embedded in both Bun glibc and musl launchers.
+# On a version tag, all eight artifacts are attached to the GitHub Release.
+#
+# #3: a `verify` job runs the C3 egress static check + typecheck + tests FIRST; every
+# build job `needs: verify`, so no artifact is ever produced from a tree that violates
+# the 0-perception outbound invariant. Local `npm run build` runs the same egress gate
+# (scripts/build.mjs) before compile.
+#
+# Cross-compiled binaries are NOT self-checked here (a foreign-arch binary cannot
+# run on the build runner). The native selfcheck (`moyu --selfcheck`) is the
+# local `npm run build` path; CI consumers should run `moyu --selfcheck` on the
+# target platform before trusting a cross-compiled artifact.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      easytier_version:
+        description: 'EasyTier release version (without leading v)'
+        required: false
+        default: '2.6.4'
+
+env:
+  EASYTIER_VERSION: ${{ inputs.easytier_version || '2.6.4' }}
+
+jobs:
+  # #3: independent C3 gate. Runs before any build; all build matrix entries depend on it.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install deps
+        run: npm ci
+      - name: C3 egress static check
+        run: npx tsx test/unit-egress.ts
+      - name: typecheck
+        run: npm run typecheck
+      - name: test
+        run: npm test
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # target dir name | EasyTier release asset (v2.6.4, verified) | binary name | output ext
+          - { target: win-x64,      asset: easytier-windows-x86_64, bin: easytier-core.exe, out: .exe }
+          - { target: win-arm64,    asset: easytier-windows-arm64,  bin: easytier-core.exe, out: .exe }
+          - { target: linux-x64,    asset: easytier-linux-x86_64,   bin: easytier-core,     out: '' }
+          - { target: linux-arm64,  asset: easytier-linux-aarch64,  bin: easytier-core,     out: '' }
+          - { target: linux-x64-musl,   asset: easytier-linux-x86_64,  bin: easytier-core,  out: '' }
+          - { target: linux-arm64-musl, asset: easytier-linux-aarch64, bin: easytier-core,  out: '' }
+          - { target: macos-x64,    asset: easytier-macos-x86_64,   bin: easytier-core,     out: '' }
+          - { target: macos-arm64,  asset: easytier-macos-aarch64,  bin: easytier-core,     out: '' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Stage vendor easytier-core for ${{ matrix.target }}
+        env:
+          ASSET_URL: https://github.com/EasyTier/EasyTier/releases/download/v${{ env.EASYTIER_VERSION }}/${{ matrix.asset }}-v${{ env.EASYTIER_VERSION }}.zip
+        run: |
+          set -euo pipefail
+          mkdir -p "bin/${{ matrix.target }}" /tmp/et
+          curl -fsSL "$ASSET_URL" -o /tmp/et.zip
+          # EasyTier archives contain easytier-core[.exe] (and other files we don't need).
+          unzip -o -q /tmp/et.zip -d /tmp/et
+          # Find the core binary (handles whether it's at the archive root or in a subfolder).
+          found="$(find /tmp/et -type f -name '${{ matrix.bin }}' | head -n1)"
+          if [ -z "$found" ]; then
+            echo "::error::easytier-core not found in ${{ matrix.asset }}"; exit 1
+          fi
+          cp "$found" "bin/${{ matrix.target }}/${{ matrix.bin }}"
+          chmod +x "bin/${{ matrix.target }}/${{ matrix.bin }}" || true
+          ls -la "bin/${{ matrix.target }}"
+
+      - name: Build moyu (cross-compile, no selfcheck)
+        run: bun scripts/build.mjs --target ${{ matrix.target }} --no-selfcheck
+
+      - name: Rename artifact
+        run: mv "dist/moyu${{ matrix.out }}" "dist/moyu-${{ matrix.target }}${{ matrix.out }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moyu-${{ matrix.target }}
+          path: dist/moyu-${{ matrix.target }}${{ matrix.out }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

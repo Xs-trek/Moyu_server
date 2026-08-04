@@ -1,0 +1,33 @@
+{
+  "name": "remote-dashboard",
+  "version": "0.0.2",
+  "private": true,
+  "type": "module",
+  "description": "Remote AI CLI control backend (claude/codex/opencode over EasyTier overlay)",
+  "license": "Apache-2.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "bun scripts/build.mjs",
+    "build:win-x64": "bun scripts/build.mjs --target win-x64",
+    "build:win-arm64": "bun scripts/build.mjs --target win-arm64",
+    "build:linux-x64": "bun scripts/build.mjs --target linux-x64",
+    "build:linux-arm64": "bun scripts/build.mjs --target linux-arm64",
+    "build:linux-x64-musl": "bun scripts/build.mjs --target linux-x64-musl",
+    "build:linux-arm64-musl": "bun scripts/build.mjs --target linux-arm64-musl",
+    "build:macos-x64": "bun scripts/build.mjs --target macos-x64",
+    "build:macos-arm64": "bun scripts/build.mjs --target macos-arm64",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/unit-config.ts && tsx test/unit-config-patch.ts && tsx test/unit-accounts.ts && tsx test/unit-auth-locations.ts && tsx test/unit-cli.ts && tsx test/unit-codex-adapter.ts && tsx test/unit-verdict.ts && tsx test/unit-hooks.ts && tsx test/unit-hook-relay.ts && tsx test/unit-logger.ts && tsx test/unit-bridge.ts && tsx test/unit-net.ts && tsx test/unit-adapter.ts && tsx test/unit-manager.ts && tsx test/unit-ws-replay.ts && tsx test/unit-diff.ts && tsx test/unit-net-notify.ts && tsx test/unit-embedded-bin.ts && tsx test/unit-egress.ts && tsx test/integration-gateway.ts"
+  },
+  "dependencies": {
+    "tsx": "^4.23.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.0"
+  }
+}
