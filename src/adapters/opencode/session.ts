@@ -66,7 +66,7 @@ export class OpencodeSession implements SessionHandle {
     this.base = `http://127.0.0.1:${port}`;
     this.child = spawn(bin, ['serve', '--port', String(port), '--hostname', '127.0.0.1'], {
       cwd: this.opts.cwd,
-      env: scrubMoyuEnv(process.env),
+      env: scrubMoyuEnv(process.env, undefined, this.opts.cwd),
       windowsHide: true,
     });
     // §5: opencode runs in the user's native env. Register credential-bearing process.env

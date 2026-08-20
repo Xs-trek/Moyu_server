@@ -3,4 +3,4 @@
 // cycle: cli.ts -> net/easytier.ts -> net/embedded-bin.ts -> cli.ts would loop.
 // Keep in sync with package.json. The compiled binary bakes this in (no
 // package.json read at runtime, so bun-compile stays self-contained).
-export const VERSION = '0.0.2';
+export const VERSION = '0.0.3';

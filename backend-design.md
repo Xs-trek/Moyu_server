@@ -1,6 +1,6 @@
 # moyu v0.0.2 后端设计定稿
 
-本文是 v0.0.2 的实现基线。它只描述已实现能力、已知边界和后续适配器扩展点，不把前端视觉或新的安全模型带入后端范围。
+本文是 v0.0.3 的实现基线。它只描述已实现能力、已知边界和后续适配器扩展点，不把前端视觉或 v0.0.4 的 OpenCode/独立 Chat 安全模型带入本版范围。
 
 ## 1. 目标与边界
 
@@ -52,6 +52,9 @@ Android glue ── REST/WS ──> moyu gateway ── stdin/stdout/hooks ─�
 
 - Claude 使用 `claude -p --output-format stream-json`；Codex 使用 `codex exec --json`，不使用需要 `clientInfo` 的 app-server。
 - 输入经 stdin/原生 CLI 参数传入，没有额外 system prompt。
+- Claude 的 Plan / Auto / Accept Edits 与模型切换均为会话级原生 argv 状态，只对后续轮次生效；不翻译为 prompt。切换只在空闲时接受。
+- Auto 只有在 CLI 明确拒绝该 permission mode 时降为 Accept Edits；失败输入不自动重放。认证、网络、Provider 拒绝或 Auto 自身的安全判定不会触发降级。
+- `requestedModel` 与 `runtimeModel` 分离：前者是用户传给 CLI 的选择，后者是本轮 CLI 事件报告值，兼容端模型身份不会反向改写用户选择。
 - 后端没有账号“测试消息”、models probe 或 provider health endpoint。
 - `test/unit-egress.ts` 用 TypeScript AST 检查所有 `src` 文件：新增出站原语必须落入明确 allowlist；源码不得出现 provider 域名字面量。
 - 实际 allowlist 只包含 relay TCP 探测、localhost CLI 管理请求、localhost hook relay，以及默认不注册的实验性 localhost OpenCode 适配器。
@@ -125,9 +128,10 @@ OpenCode/PTY 不属于 v0.0.2 可用适配器。OpenCode 仅保留实验代码�
 账号 profile：
 
 - Claude：`<config-dir>/profiles/claude/<name>.env`，只读并在 spawn 时合并。
-- Codex：`<config-dir>/profiles/codex/<name>.home`，文件第一行指向用户预先 `codex login` 的 `CODEX_HOME`。
+- Codex：`<config-dir>/profiles/codex/<name>.home`，首个裸行或 `CODEX_HOME=` 指向用户预先配置的目录；可追加该目录自定义 `model_provider.env_key` 所需的 `KEY=VALUE`。OAuth/API login、`config.toml` 和凭据均由用户/原生 CLI 创建，moyu 只读引用。
 - `/accounts` 只返回 profile 名、类型和凭证字段存在性，不返回值、不主动验证可用性。
-- Codex 选择 `CODEX_HOME` 时清除继承的 `CODEX_API_KEY`/`CODEX_ACCESS_TOKEN`，避免 shell env 覆盖所选原生账号。
+- Codex 选择 `CODEX_HOME` 时先清除继承的 `OPENAI_API_KEY`/`CODEX_API_KEY`/`CODEX_ACCESS_TOKEN`，再叠加该 `.home` 的显式变量，避免 shell env 覆盖 OAuth、OpenAI API Key 或火山类自定义 URL Profile。
+- Codex 自定义 URL 沿用原生 `model_provider` 契约；v0.0.3 绑定 0.146.x，其 `wire_api` 仅支持 Responses。Moyu 不把 Chat Completions 端点伪装成 Responses，也不做 Provider 探测。
 
 `moyu init` 自动生成本地 token/network secret、创建两个 profile 目录、探测 CLI 版本，并只要求一次 relay 输入。再次运行按 Enter 保留 relay。OAuth/login 始终由用户执行原生 CLI，moyu 不接管浏览器或 token exchange。
 
@@ -167,7 +171,7 @@ CLI 正常执行失败使用 `turn.failed{category,summary}`，类别只有 `aut
 
 ## 10. 配置与网络
 
-配置优先级：`-config` > `REMOTE_DASHBOARD_CONFIG` > `~/.remote-dashboard/config.json`。文件以 0600 写入；`privateMode=true` 和 loopback bind 强制恢复。运行时 PATCH 只允许端口范围、relay/虚拟地址提示、默认 adapter、审批超时、日志等级和安全的 adapter 选项；token、networkSecret、二进制路径和 bindHost 不可由远端 PATCH。
+配置优先级：`-config` > `REMOTE_DASHBOARD_CONFIG` > `~/.remote-dashboard/config.json`。文件以 0600 写入；Windows 使用仅含当前用户与 SYSTEM 的继承隔离 DACL，并通过不依赖 PowerShell 模块的 .NET API 复核。`privateMode=true` 和 loopback bind 强制恢复。运行时 PATCH 只允许端口范围、relay/虚拟地址提示、默认 adapter、审批超时、日志等级和安全的 adapter 选项；token、networkSecret、二进制路径和 bindHost 不可由远端 PATCH。
 
 NetProbe 只对用户配置的 relay 做有界 TCP connect，并输出网络建议；不探测 AI provider、不改防火墙、不改 Clash。Clash 节点延迟如未来由 Android/用户配置提供，可由 glue 展示；后端不依赖 Clash API。
 

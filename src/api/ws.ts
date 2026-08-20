@@ -1,5 +1,5 @@
-// WebSocket /api/v1/ws?token= . Subscribe to a session, stream events (I10),
-// receive input/approval/interrupt. Token verified at upgrade (S1).
+// WebSocket /api/v1/ws. Subscribe to a session, stream events (I10), receive
+// input/approval/interrupt. A Bearer header is verified at upgrade (S1).
 import type { Server } from 'node:http';
 import type { ServerContext } from '../context';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -127,8 +127,38 @@ function isNonNegativeInt(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
-function isApprovalDecision(value: unknown): value is ApprovalDecision {
-  return value === 'allow' || value === 'allow_session' || value === 'deny' || value === 'cancel';
+export function isApprovalDecision(value: unknown): value is ApprovalDecision {
+  if (value === 'allow' || value === 'allow_session' || value === 'deny' || value === 'cancel') return true;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const outer = value as Record<string, unknown>;
+  if (Object.keys(outer).length !== 1 || !Object.prototype.hasOwnProperty.call(outer, 'allowWithModification')) return false;
+  const modification = outer.allowWithModification;
+  if (!modification || typeof modification !== 'object' || Array.isArray(modification)) return false;
+  const mod = modification as Record<string, unknown>;
+  if (Object.keys(mod).length !== 1 || !Object.prototype.hasOwnProperty.call(mod, 'answers')) return false;
+  const answers = mod.answers;
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) return false;
+  const entries = Object.entries(answers as Record<string, unknown>);
+  if (entries.length < 1 || entries.length > 4) return false;
+  let totalChars = 0;
+  for (const [question, answer] of entries) {
+    if (!question || question.length > 2_000) return false;
+    totalChars += question.length;
+    if (typeof answer === 'string') {
+      if (!answer || answer.length > 2_000) return false;
+      totalChars += answer.length;
+    } else if (Array.isArray(answer)) {
+      if (answer.length < 1 || answer.length > 20) return false;
+      for (const selected of answer) {
+        if (typeof selected !== 'string' || !selected || selected.length > 2_000) return false;
+        totalChars += selected.length;
+      }
+    } else {
+      return false;
+    }
+    if (totalChars > 16_000) return false;
+  }
+  return true;
 }
 
 function badMessage(ws: WebSocket, summary: string): void {

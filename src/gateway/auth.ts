@@ -7,20 +7,8 @@ export function extractBearer(req: IncomingMessage): string | undefined {
   if (typeof h === 'string' && h.toLowerCase().startsWith('bearer ')) {
     return h.slice(7).trim();
   }
-  // WS upgrade may carry ?token=
-  const url = req.url ?? '';
-  const m = /[?&]token=([^&]+)/.exec(url);
-  if (m && m[1]) {
-    // [M] decodeURIComponent throws URIError on malformed encoding (e.g. %zz). Callers are
-    // outside try/catch (server.ts REST path is async -> unhandledRejection; ws.ts upgrade is
-    // a sync event handler -> uncaughtException) -> process crash = unauthenticated remote DoS
-    // (overlay -n maps a peer onto 127.0.0.1). Treat bad encoding as no token -> 401.
-    try {
-      return decodeURIComponent(m[1]);
-    } catch {
-      return undefined;
-    }
-  }
+  // Never accept a long-lived gateway credential from a URL. Query strings are routinely
+  // copied into diagnostics and proxy/access logs; WebSocket upgrades support Authorization.
   return undefined;
 }
 

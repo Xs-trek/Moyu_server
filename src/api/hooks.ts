@@ -1,14 +1,13 @@
-// Claude PreToolUse HTTP hook endpoint (P2). localhost-only, no Bearer (for the route).
-// Security: MUST respond 2xx + {hookSpecificOutput:{permissionDecision:"deny"}} to block;
-// non-2xx/timeout = non-blocking (tool continues). Fail-closed -> deny on any error.
+// Local PreToolUse gateway endpoint (P2), consumed by the built-in command-hook relay.
+// The endpoint returns structured 2xx deny responses for all validation failures; independently,
+// the relay maps non-2xx, connection, parsing and timeout failures to blocking exit code 2.
 //
 // F8: the gateway shares 127.0.0.1:gwPort with the overlay data plane, and EasyTier's
 // `-n 127.0.0.1/32->VIP` maps the overlay peer onto loopback (it appears as 127.0.0.1), so
 // the localhost-only route check does NOT stop an overlay peer from POSTing to /hooks. The
-// per-session shared secret closes that: the claude CLI sends `Authorization: Bearer <secret>`
-// (interpolated from its spawn env via headers+allowedEnvVars), and the backend verifies it.
-// An overlay peer has no way to obtain the ephemeral per-session secret. Fail-closed: a
-// missing/mismatched secret -> 200+deny (NOT 401; non-2xx would let the tool proceed = fail-open).
+// per-session shared secret closes that: the private local relay sends
+// `Authorization: Bearer <secret>`, and the backend verifies it. An overlay peer has no way to
+// obtain the ephemeral per-session secret. A missing/mismatched secret returns a neutral deny.
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { log } from '../util/logger';
@@ -102,7 +101,9 @@ const DENY = {
   hookSpecificOutput: {
     hookEventName: 'PreToolUse' as const,
     permissionDecision: 'deny' as const,
-    permissionDecisionReason: 'denied by remote-dashboard gateway',
+    // This value is consumed by the native CLI and may enter its transcript. Keep it neutral:
+    // never disclose the gateway, device, or operator that supplied the decision.
+    permissionDecisionReason: 'approval was not granted',
   },
 };
 
@@ -123,11 +124,10 @@ export async function handlePreToolUse(
     sendJson(res, 200, DENY);
     return;
   }
-  // #1: routing key. Claude sends payload.session_id (= cliSessionRef, claude's real session
-  // id). Codex exec's PreToolUse COMMAND hook relay cannot use payload.session_id -- codex's
-  // thread_id is assigned on first turn and is NOT the backend sessionId -- so the relay command
-  // sends X-Moyu-Session: <backend sessionId> and the registry is keyed by that. Header wins.
-  const hdrSession = req.headers['x-moyu-session'];
+  // #1: routing key. Command relays supply the registry key explicitly: Claude uses its actual
+  // cliSessionRef, while Codex uses the backend id because its thread id is assigned later.
+  // The payload session_id remains as compatibility for a direct/legacy Claude hook. Header wins.
+  const hdrSession = req.headers['x-local-session'];
   const headerSession = Array.isArray(hdrSession) ? hdrSession[0] : hdrSession;
   const routingKey =
     typeof headerSession === 'string' && headerSession

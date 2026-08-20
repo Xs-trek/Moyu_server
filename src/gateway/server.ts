@@ -73,6 +73,14 @@ export async function startServer(ctx: ServerContext): Promise<Server> {
     res.end();
   });
 
+  // Explicit, conservative bounds for the overlay-facing HTTP surface. Native-history reads
+  // can legitimately take longer than ordinary control requests, while a stalled peer must not
+  // retain a header/body socket indefinitely.
+  server.headersTimeout = 15_000;
+  server.requestTimeout = 120_000;
+  server.keepAliveTimeout = 5_000;
+  server.maxHeadersCount = 100;
+
   attachWs(ctx, server);
 
   // §10 I7: broadcast a net change notification on every overlay state transition

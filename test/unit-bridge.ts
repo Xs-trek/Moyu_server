@@ -2,7 +2,7 @@
 // timers + deleted the map, leaving registered callers' Promises pending forever).
 // Verifies clear() resolves every pending approval as 'deny'.
 // Run: npx tsx test/unit-bridge.ts
-import { ApprovalTracker } from '../src/approval/bridge';
+import { ApprovalTracker, toClaude, toCodexHook } from '../src/approval/bridge';
 import type { ApprovalDecision } from '../src/adapters/types';
 
 let pass = 0;
@@ -18,6 +18,16 @@ function check(name: string, cond: boolean): void {
 }
 
 async function main(): Promise<void> {
+  const denied = toCodexHook('deny', { command: 'echo test' });
+  check('codex deny reason is neutral', denied.hookSpecificOutput.permissionDecisionReason === 'approval was not granted');
+  check('codex deny reason has no remote identity', !/moyu|remote|phone|mobile/i.test(denied.hookSpecificOutput.permissionDecisionReason ?? ''));
+  const claudeInput = { command: 'echo test' };
+  const claudeAllowed = toClaude('allow', claudeInput);
+  check('claude allow echoes original input for relay validation', claudeAllowed.hookSpecificOutput.updatedInput === claudeInput);
+  const claudeDenied = toClaude('deny', claudeInput);
+  check('claude deny reason is neutral', claudeDenied.hookSpecificOutput.permissionDecisionReason === 'approval was not granted');
+  check('claude deny reason has no integration identity', !/moyu|remote|phone|mobile|provider/i.test(claudeDenied.hookSpecificOutput.permissionDecisionReason ?? ''));
+
   // 1. clear() resolves a single pending as 'deny' + fires onResolved.
   const resolved: Array<{ id: string; decision: ApprovalDecision; timedOut: boolean }> = [];
   const t = new ApprovalTracker(600, (id, decision, timedOut) => resolved.push({ id, decision, timedOut }));

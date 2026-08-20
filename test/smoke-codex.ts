@@ -75,7 +75,9 @@ async function main(): Promise<void> {
   const sessionId = created.sessionId;
   console.log('sessionId:', sessionId);
 
-  const ws = new WebSocket(`${wsBase}/api/v1/ws?token=${token}`);
+  const ws = new WebSocket(`${wsBase}/api/v1/ws`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
   await new Promise<void>((res, rej) => {
     ws.on('open', res);
     ws.on('error', rej);

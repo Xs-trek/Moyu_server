@@ -1,4 +1,4 @@
-// Claude adapter (A1). Subprocess `claude -p --output-format stream-json` + PreToolUse hook.
+// Claude adapter (A1). Subprocess `claude -p --output-format stream-json` + local command hook.
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Adapter, AuthProfile, SessionHandle, SessionOpts } from '../types';
@@ -43,13 +43,15 @@ export class ClaudeAdapter implements Adapter {
     interrupt: true,
     accountProfiles: true,
     approval: {
-      transport: 'http-hook' as const,
+      transport: 'command-hook' as const,
       semantics: 'remote-every-tool-or-never' as const,
       policies: ['untrusted', 'on-failure', 'on-request', 'never'] as const,
     },
     configuration: {
       model: true,
+      modelSelection: 'freeform' as const,
       effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] as const,
+      permissionModes: ['plan', 'auto', 'acceptEdits'] as const,
       sandboxModes: [] as const,
       reviewers: [] as const,
     },
@@ -71,6 +73,9 @@ export class ClaudeAdapter implements Adapter {
   async startSession(opts: SessionOpts): Promise<SessionHandle> {
     const bin = this.deps.adapterConfig.bin ?? resolveClaudeBinary();
     if (!bin) throw new Error('claude binary not found (set adapters.claude.bin or install claude-code)');
+    // AccountService returns {} for the native profile. Any populated env comes from a selected
+    // *.env profile and must not inherit a different native auth/base-URL selection.
+    const isolateProfileAuthEnv = Object.keys(opts.profileEnv ?? {}).length > 0;
     const session = new ClaudeSession({
       sessionId: opts.sessionId,
       cliSessionRef: opts.cliSessionRef ?? opts.sessionId,
@@ -82,6 +87,8 @@ export class ClaudeAdapter implements Adapter {
       approvalPolicy: this.deps.adapterConfig.approvalPolicy,
       model: opts.model ?? this.deps.adapterConfig.model,
       effort: opts.effort,
+      permissionMode: opts.permissionMode ?? 'acceptEdits',
+      isolateProfileAuthEnv,
       profileEnv: mergeConfigDirectoryEnv(
         this.deps.adapterConfig.configDir,
         'CLAUDE_CONFIG_DIR',

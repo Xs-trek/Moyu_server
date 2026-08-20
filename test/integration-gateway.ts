@@ -6,6 +6,9 @@
 import { WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { findFreePort } from '../src/gateway/ports';
 import { startServer } from '../src/gateway/server';
 import { AdapterManager } from '../src/adapters/manager';
@@ -27,6 +30,7 @@ import type {
   SessionOpts,
 } from '../src/adapters/types';
 import { createInboundPolicy, type NetStatus } from '../src/net/types';
+import { ArtifactStore } from '../src/artifacts/store';
 
 // ---------- mock adapter ----------
 class MockSessionHandle implements SessionHandle {
@@ -100,26 +104,29 @@ class MockSessionHandle implements SessionHandle {
 class MockAdapter implements Adapter {
   readonly kind: 'claude' | 'codex';
   readonly displayName: string;
-  readonly capabilities = {
-    streaming: { text: true, thinking: true, tools: true },
-    resume: true,
-    interrupt: true,
-    accountProfiles: true,
-    approval: {
-      transport: 'http-hook' as const,
-      semantics: 'remote-every-tool-or-never' as const,
-      policies: ['untrusted', 'never'] as const,
-    },
-    configuration: {
-      effortLevels: ['low', 'medium', 'high'] as const,
-      model: true,
-      sandboxModes: ['workspace-write'] as const,
-      reviewers: ['user'] as const,
-    },
-  };
+  readonly capabilities: Adapter['capabilities'];
   constructor(kind: 'claude' | 'codex', displayName: string) {
     this.kind = kind;
     this.displayName = displayName;
+    this.capabilities = {
+      streaming: { text: true, thinking: true, tools: true },
+      resume: true,
+      interrupt: true,
+      accountProfiles: true,
+      approval: {
+        transport: 'command-hook',
+        semantics: 'remote-every-tool-or-never',
+        policies: ['untrusted', 'never'],
+      },
+      configuration: {
+        effortLevels: ['low', 'medium', 'high'],
+        permissionModes: ['plan', 'auto', 'acceptEdits'],
+        model: true,
+        modelSelection: 'freeform',
+        sandboxModes: kind === 'codex' ? ['workspace-write'] : [],
+        reviewers: kind === 'codex' ? ['user'] : [],
+      },
+    };
   }
   async isAvailable(): Promise<boolean> { return true; }
   async detect(): Promise<AuthProfile> {
@@ -150,7 +157,9 @@ async function api(port: number, token: string, method: string, path: string, bo
 interface WsCollector { ws: WebSocket; events: any[]; }
 function openWs(port: number, token: string): Promise<WsCollector> {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws?token=${token}`);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
     const events: any[] = [];
     ws.on('open', () => resolve({ ws, events }));
     ws.on('message', (raw) => { try { events.push(JSON.parse(raw.toString())); } catch { /* ignore */ } });
@@ -174,6 +183,29 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function main(): Promise<void> {
   const token = 'test-token-fixed';
   const controlToken = 'pc-only-control-fixed';
+  const nativeRoot = mkdtempSync(join(tmpdir(), 'moyu-native-integration-'));
+  const claudeConfigDir = join(nativeRoot, 'claude');
+  const codexConfigDir = join(nativeRoot, 'codex');
+  const nativeClaudeId = '44444444-4444-4444-8444-444444444444';
+  const nativeClaudeOlderId = '55555555-5555-4555-8555-555555555555';
+  const nativeClaudeProject = join(claudeConfigDir, 'projects', 'D--native');
+  mkdirSync(nativeClaudeProject, { recursive: true });
+  mkdirSync(codexConfigDir, { recursive: true });
+  writeFileSync(join(claudeConfigDir, 'settings.json'), JSON.stringify({
+    model: 'opus',
+    env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-integration' },
+  }));
+  writeFileSync(join(codexConfigDir, 'config.toml'), 'model = "gpt-integration"\n');
+  writeFileSync(join(nativeClaudeProject, `${nativeClaudeId}.jsonl`), [
+    JSON.stringify({ type: 'user', timestamp: '2026-08-09T01:00:00.000Z', cwd: process.cwd(), message: { role: 'user', content: 'native hello' } }),
+    '{bad json',
+    JSON.stringify({ type: 'assistant', timestamp: '2026-08-09T01:00:01.000Z', cwd: process.cwd(), message: { id: 'native-a1', role: 'assistant', model: 'glm-integration', content: [{ type: 'text', text: 'native reply' }] } }),
+    JSON.stringify({ type: 'ai-title', sessionId: nativeClaudeId, aiTitle: 'Native integration session' }),
+  ].join('\n') + '\n');
+  writeFileSync(join(nativeClaudeProject, `${nativeClaudeOlderId}.jsonl`), [
+    JSON.stringify({ type: 'user', timestamp: '2026-08-08T01:00:00.000Z', cwd: process.cwd(), message: { role: 'user', content: 'older native hello' } }),
+    JSON.stringify({ type: 'assistant', timestamp: '2026-08-08T01:00:01.000Z', cwd: process.cwd(), message: { id: 'native-a2', role: 'assistant', model: 'glm-integration', content: [{ type: 'text', text: 'older native reply' }] } }),
+  ].join('\n') + '\n');
   const config: AppConfig = {
     gateway: { portMin: 19000, portMax: 19099, bindHost: '127.0.0.1' },
     network: { publicNode: 'tcp://test.example:11010', privateMode: true, networkSecret: 'sec', networkName: 'rd-test' },
@@ -182,8 +214,8 @@ async function main(): Promise<void> {
     logLevel: 'warn',
     ptyAddon: { enabled: false },
     adapters: {
-      claude: { approvalPolicy: 'untrusted', sandbox: 'workspace-write', approvalsReviewer: 'user' },
-      codex: { approvalPolicy: 'untrusted', sandbox: 'workspace-write', approvalsReviewer: 'user' },
+      claude: { approvalPolicy: 'untrusted', sandbox: 'workspace-write', approvalsReviewer: 'user', configDir: claudeConfigDir },
+      codex: { approvalPolicy: 'untrusted', sandbox: 'workspace-write', approvalsReviewer: 'user', configDir: codexConfigDir },
     },
     token,
     controlToken,
@@ -193,7 +225,8 @@ async function main(): Promise<void> {
   const adapters = new AdapterManager();
   adapters.register(new MockAdapter('claude', 'claude (mock)'));
   adapters.register(new MockAdapter('codex', 'codex (mock)'));
-  const sessions = new SessionManager(adapters);
+  const artifacts = new ArtifactStore();
+  const sessions = new SessionManager(adapters, artifacts);
   const hooks = new HookRegistry();
   const accounts = new AccountService();
   const mockNetStatus: NetStatus = {
@@ -209,7 +242,7 @@ async function main(): Promise<void> {
   const shutdownRequests: string[] = [];
 
   const ctx: ServerContext = {
-    config, adapters, sessions, hooks, port,
+    config, adapters, sessions, artifacts, hooks, port,
     startedAt: new Date().toISOString(), net, overlay, accounts, pairing,
     netNotifier: new NetNotifier(),
     requestShutdown: (reason) => { shutdownRequests.push(reason); },
@@ -217,6 +250,8 @@ async function main(): Promise<void> {
   const server: Server = await startServer(ctx);
 
   try {
+    ok('gateway has explicit bounded HTTP timeouts', server.headersTimeout === 15_000 &&
+      server.requestTimeout === 120_000 && server.keepAliveTimeout === 5_000 && server.maxHeadersCount === 100);
     // 1. auth: no token -> 401
     const noTok = await fetch(`http://127.0.0.1:${port}/api/v1/server/info`);
     ok('auth: missing token -> 401', noTok.status === 401, `(got ${noTok.status})`);
@@ -227,6 +262,71 @@ async function main(): Promise<void> {
     ok('/server/info has adapters', Array.isArray((info.body as any)?.adapters) && (info.body as any).adapters.length === 2);
     ok('/server/info defaultAdapter=claude', (info.body as any)?.defaultAdapter === 'claude');
     ok('/server/info exposes adapter capabilities', (info.body as any)?.adapters?.[0]?.capabilities?.streaming?.tools === true);
+    const claudeInfo = (info.body as any)?.adapters?.find((adapter: any) => adapter.kind === 'claude');
+    const codexInfo = (info.body as any)?.adapters?.find((adapter: any) => adapter.kind === 'codex');
+    ok('/server/info projects local effective/default models without a provider catalog',
+      claudeInfo?.effectiveModel === 'glm-integration' && claudeInfo?.cliDefaultModel === 'glm-integration' &&
+      claudeInfo?.modelOverride === undefined && claudeInfo?.capabilities?.configuration?.modelSelection === 'freeform');
+    ok('/server/info preserves adapter configuration arrays',
+      claudeInfo?.capabilities?.configuration?.sandboxModes?.length === 0 &&
+      claudeInfo?.capabilities?.configuration?.reviewers?.length === 0 &&
+      codexInfo?.capabilities?.configuration?.sandboxModes?.[0] === 'workspace-write' &&
+      codexInfo?.capabilities?.configuration?.reviewers?.[0] === 'user');
+    const nativeClaudeProfile = (info.body as any)?.accountSwitching?.adapters?.claude?.profiles
+      ?.find((profile: any) => profile.sourceKind === 'nativeDefault');
+    ok('/server/info account projection carries profile-local model metadata',
+      nativeClaudeProfile?.cliDefaultModel === 'glm-integration' && nativeClaudeProfile?.effectiveModel === 'glm-integration');
+
+    // Valid 1x1 PNG with a tEXt chunk that would identify the frontend/device if forwarded.
+    const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAGnRFWHRTb2Z0d2FyZQBBbmRyb2lkIEdQUyBQaG9uZdNNxGUAAAANSURBVHicY/jPwPAfAAUAAf+JmT0dAAAAAElFTkSuQmCC', 'base64');
+    const sanitizedImageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==', 'base64');
+    const artifactUpload = await fetch(`http://127.0.0.1:${port}/api/v1/artifacts?name=screen.png`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'content-type': 'image/png' },
+      body: imageBytes,
+    });
+    const artifactRef = await artifactUpload.json() as any;
+    ok('POST /artifacts stores a bounded metadata-sanitized image', artifactUpload.status === 201 &&
+      typeof artifactRef?.artifactId === 'string' && artifactRef?.mime === 'image/png' && artifactRef?.size === sanitizedImageBytes.length);
+    const artifactDownload = await fetch(`http://127.0.0.1:${port}/api/v1/artifacts/${artifactRef.artifactId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const downloadedBytes = Buffer.from(await artifactDownload.arrayBuffer());
+    ok('GET /artifacts returns pixels without frontend metadata', artifactDownload.status === 200 &&
+      downloadedBytes.equals(sanitizedImageBytes) && !downloadedBytes.includes(Buffer.from('Android GPS Phone')));
+
+    const nativeBadLimit = await api(port, token, 'GET', '/api/v1/native-sessions?limit=0');
+    ok('GET /native-sessions rejects out-of-range limit', nativeBadLimit.status === 400, `(got ${nativeBadLimit.status})`);
+    const nativeBadOffset = await api(port, token, 'GET', '/api/v1/native-sessions?offset=-1');
+    ok('GET /native-sessions rejects negative offset', nativeBadOffset.status === 400, `(got ${nativeBadOffset.status})`);
+    const nativeExcessiveOffset = await api(port, token, 'GET', '/api/v1/native-sessions?offset=4001');
+    ok('GET /native-sessions rejects excessive offset', nativeExcessiveOffset.status === 400, `(got ${nativeExcessiveOffset.status})`);
+    const nativeList = await api(port, token, 'GET', '/api/v1/native-sessions?limit=10');
+    const nativeItem = (nativeList.body as any)?.items?.find((item: any) => item.nativeSessionId === nativeClaudeId);
+    ok('GET /native-sessions -> bounded native item', nativeList.status === 200 && nativeItem?.model === 'glm-integration' &&
+      (nativeList.body as any)?.hasMore === false && typeof (nativeList.body as any)?.nextOffset === 'number');
+    const nativeFirstPage = await api(port, token, 'GET', '/api/v1/native-sessions?limit=1&offset=0');
+    const nativeFirstBody = nativeFirstPage.body as any;
+    const nativeSecondPage = await api(port, token, 'GET', `/api/v1/native-sessions?limit=1&offset=${nativeFirstBody?.nextOffset}`);
+    const nativeSecondBody = nativeSecondPage.body as any;
+    const pagedNativeIds = [nativeFirstBody?.items?.[0]?.nativeSessionId, nativeSecondBody?.items?.[0]?.nativeSessionId];
+    ok('GET /native-sessions first page exposes continuation', nativeFirstPage.status === 200 &&
+      nativeFirstBody?.items?.length === 1 && nativeFirstBody?.hasMore === true && nativeFirstBody?.nextOffset === 1);
+    ok('GET /native-sessions nextOffset reaches older distinct item and terminates', nativeSecondPage.status === 200 &&
+      nativeSecondBody?.items?.length === 1 && nativeSecondBody?.hasMore === false &&
+      new Set(pagedNativeIds).size === 2 && pagedNativeIds.includes(nativeClaudeId) && pagedNativeIds.includes(nativeClaudeOlderId));
+    const nativeMessages = await api(port, token, 'GET', `/api/v1/native-sessions/claude/${nativeClaudeId}/messages?after=0&limit=1`);
+    ok('GET native messages -> cursor object', nativeMessages.status === 200 &&
+      Array.isArray((nativeMessages.body as any)?.items) && (nativeMessages.body as any).items.length === 1 &&
+      (nativeMessages.body as any)?.hasMore === true && (nativeMessages.body as any)?.nextAfter === 1);
+    const nativeResume = await api(port, token, 'POST', `/api/v1/native-sessions/claude/${nativeClaudeId}/resume`);
+    const nativeSid = (nativeResume.body as any)?.sessionId;
+    ok('POST native resume -> manager session', nativeResume.status === 201 && typeof nativeSid === 'string' &&
+      (nativeResume.body as any)?.session?.cliSessionRef === nativeClaudeId &&
+      (nativeResume.body as any)?.session?.model === 'glm-integration');
+    const seeded = await api(port, token, 'GET', `/api/v1/sessions/${nativeSid}/messages`);
+    ok('resumed manager session is seeded with normalized native messages', seeded.status === 200 &&
+      Array.isArray(seeded.body) && (seeded.body as any[]).map((message) => message.text).join(',') === 'native hello,native reply');
 
     // PC daemon lifecycle requires a second, never-paired control secret. Possession of the
     // phone's normal bearer alone must not permit stopping the backend.
@@ -258,6 +358,12 @@ async function main(): Promise<void> {
     ok('POST /sessions returns sessionId', typeof sid === 'string');
     ok('POST /sessions returns selected profile/model',
       (create.body as any)?.session?.profileId === 'claude:native' && (create.body as any)?.session?.model === 'mock-model');
+    const staleProfileCreate = await api(port, token, 'POST', '/api/v1/sessions', {
+      kind: 'claude', profileId: 'claude:env:deleted-private-name',
+    });
+    ok('POST /sessions stale profile -> stable actionable error without profile disclosure',
+      staleProfileCreate.status === 409 && (staleProfileCreate.body as any)?.error === 'profile_unavailable' &&
+      !(staleProfileCreate.body as any)?.summary?.includes('deleted-private-name'));
 
     const effort = await api(port, token, 'POST', `/api/v1/sessions/${sid}/effort`, { effort: 'high' });
     ok('POST /sessions/:id/effort -> 200', effort.status === 200, `(got ${effort.status})`);
@@ -283,8 +389,11 @@ async function main(): Promise<void> {
 
     // 7. REST input is asynchronous: 202 must arrive before approval/turn completion.
     const inputStarted = Date.now();
-    const inputAccepted = await api(port, token, 'POST', `/api/v1/sessions/${sid}/input`, { text: 'say hi' });
-    ok('POST /input -> 202 before turn completion', inputAccepted.status === 202 && Date.now() - inputStarted < 500);
+    const inputAccepted = await api(port, token, 'POST', `/api/v1/sessions/${sid}/input`, {
+      text: 'say hi', attachments: [artifactRef.artifactId],
+    });
+    ok('POST /input -> 202 before turn completion', inputAccepted.status === 202 &&
+      typeof (inputAccepted.body as any)?.seq === 'number' && Date.now() - inputStarted < 500);
     const apReq = await waitFor(events, (e) => e.type === 'event' && e.event.type === 'approval.request');
     ok('accepted input -> approval.request emitted', !!apReq);
     ok('approval.request kind=command', apReq.event.kind === 'command');
@@ -302,6 +411,9 @@ async function main(): Promise<void> {
     ws.send(JSON.stringify({ type: 'approval', sessionId: sid, approvalId: apReq.event.approvalId, decision: 'allow' }));
     const done = await waitFor(events, (e) => e.type === 'event' && e.event.type === 'turn.completed');
     ok('WS approval allow -> turn.completed', !!done);
+    ok('turn.completed exposes a finite locally observed duration',
+      Number.isFinite(done?.event?.performance?.observedDurationMs)
+        && done.event.performance.observedDurationMs >= 0);
     const postTypes = events.filter((e) => e.type === 'event').map((e) => e.event.type)
       .filter((type) => type !== 'transport.metrics').slice(6);
     ok('post-approval seq: approval.resolved,tool.output,tool.done,turn.completed',
@@ -325,6 +437,8 @@ async function main(): Promise<void> {
     const roles = (msgs.body as any[]).map((m) => m.role);
     ok('messages contain user+assistant+tool', roles.includes('user') && roles.includes('assistant') && roles.includes('tool'),
       `(roles=${roles.join(',')})`);
+    const sentUser = (msgs.body as any[]).find((message) => message.role === 'user' && message.text === 'say hi');
+    ok('accepted user message persists canonical artifact metadata', sentUser?.artifacts?.[0]?.artifactId === artifactRef.artifactId);
 
     // 10. ping/pong + pty error
     ws.send(JSON.stringify({ type: 'ping' }));
@@ -492,7 +606,9 @@ async function main(): Promise<void> {
     if (fail > 0) process.exitCode = 1;
   } finally {
     await sessions.disposeAll();
+    artifacts.dispose();
     server.close();
+    rmSync(nativeRoot, { recursive: true, force: true });
   }
 }
 

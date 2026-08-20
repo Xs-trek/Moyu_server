@@ -9,6 +9,10 @@ export interface AdapterStatus {
   available: boolean;
   auth: AuthProfile | null;
   capabilities: Adapter['capabilities'];
+  /** Added by the REST projection from local config/profile data; never provider-probed. */
+  cliDefaultModel?: string;
+  effectiveModel?: string;
+  modelOverride?: string;
 }
 
 export class AdapterManager {

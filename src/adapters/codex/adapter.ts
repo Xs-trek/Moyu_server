@@ -66,7 +66,9 @@ export class CodexAdapter implements Adapter {
     },
     configuration: {
       model: true,
+      modelSelection: 'freeform' as const,
       effortLevels: ['minimal', 'low', 'medium', 'high', 'xhigh'] as const,
+      permissionModes: [] as const,
       sandboxModes: ['read-only', 'workspace-write', 'danger-full-access'] as const,
       reviewers: ['user', 'auto_review', 'guardian_subagent'] as const,
     },

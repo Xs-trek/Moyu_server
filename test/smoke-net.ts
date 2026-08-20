@@ -4,7 +4,7 @@
 // Run: npx tsx test/smoke-net.ts
 import { NetProbe } from '../src/net/probe';
 
-const PUBLIC_NODE = process.env.PUBLIC_NODE ?? 'tcp://203.0.113.5:11010';
+const PUBLIC_NODE = process.env.PUBLIC_NODE ?? 'tcp://47.109.138.211:11010';
 
 function assert(cond: boolean, msg: string): void {
   if (!cond) {

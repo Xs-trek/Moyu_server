@@ -19,6 +19,9 @@ interface CurrentBlock {
 }
 
 const MAX_ACCUMULATED_CHARS = 256 * 1024;
+const MAX_TOOL_IMAGES = 4;
+const MAX_CONTENT_BLOCKS_SCANNED = 256;
+const MAX_IMAGE_BASE64_CHARS = Math.ceil((8 * 1024 * 1024) / 3) * 4;
 
 function appendBounded(current: { buf: string; truncated?: boolean }, chunk: string): void {
   const remaining = MAX_ACCUMULATED_CHARS - current.buf.length;
@@ -36,9 +39,28 @@ function capText(value: string): string {
     : value.slice(0, MAX_ACCUMULATED_CHARS) + '…[truncated]';
 }
 
+function imagePayload(value: unknown): { base64: string; mime: string; name?: string } | null {
+  if (!value || typeof value !== 'object') return null;
+  const item = value as Record<string, unknown>;
+  if (item.type !== 'image') return null;
+  const source = item.source && typeof item.source === 'object' ? item.source as Record<string, unknown> : undefined;
+  const file = item.file && typeof item.file === 'object' ? item.file as Record<string, unknown> : undefined;
+  const base64 = source?.data ?? file?.base64 ?? item.data ?? item.base64;
+  const mime = source?.media_type ?? source?.mediaType ?? file?.type ?? item.mime_type ?? item.mimeType;
+  if (typeof base64 !== 'string' || base64.length > MAX_IMAGE_BASE64_CHARS || typeof mime !== 'string') return null;
+  const boundedMime = mime.trim().slice(0, 128);
+  if (!boundedMime) return null;
+  return {
+    base64,
+    mime: boundedMime,
+    name: typeof item.name === 'string' ? item.name.slice(0, 160) : undefined,
+  };
+}
+
 export class ClaudeStreamParser {
   private current: CurrentBlock | null = null;
   private done = false;
+  private model: string | undefined;
 
   constructor(private emit: (e: AdapterEvent) => void) {}
 
@@ -53,12 +75,20 @@ export class ClaudeStreamParser {
     }
     switch (o.type) {
       case 'system':
+        if (typeof o.model === 'string' && o.model.trim() && o.model !== '<synthetic>') this.model = o.model.trim();
         return; // init
       case 'stream_event':
         this.onStream((o as { event: Record<string, unknown> }).event);
         return;
-      case 'assistant':
-        return; // full message; deltas already emitted via stream_event
+      case 'assistant': {
+        // Full assistant messages duplicate the streamed text, but their metadata is the
+        // authoritative runtime model (including provider-compatible alias resolution).
+        const message = o.message as { model?: unknown } | undefined;
+        if (typeof message?.model === 'string' && message.model.trim() && message.model !== '<synthetic>') {
+          this.model = message.model.trim();
+        }
+        return;
+      }
       case 'user':
         this.onUser((o as { message?: { content?: unknown[] } }).message);
         return;
@@ -128,18 +158,28 @@ export class ClaudeStreamParser {
 
   private onUser(message: { content?: unknown[] } | undefined): void {
     if (!message || !Array.isArray(message.content)) return;
-    for (const c of message.content) {
+    for (const c of message.content.slice(0, MAX_CONTENT_BLOCKS_SCANNED)) {
       const r = c as { type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean };
       if (r && r.type === 'tool_result' && r.tool_use_id) {
         let text = '';
         if (typeof r.content === 'string') text = capText(r.content);
         else if (Array.isArray(r.content)) {
-          for (const item of r.content) {
+          for (const item of r.content.slice(0, MAX_CONTENT_BLOCKS_SCANNED)) {
             text = capText(text + ((item as { text?: string })?.text ?? ''));
             if (text.endsWith('…[truncated]')) break;
           }
         }
         this.emit({ type: 'tool.output', toolCallId: r.tool_use_id, text });
+        if (Array.isArray(r.content)) {
+          let imageCount = 0;
+          for (const item of r.content.slice(0, MAX_CONTENT_BLOCKS_SCANNED)) {
+            const image = imagePayload(item);
+            if (image) {
+              this.emit({ type: 'tool.output', toolCallId: r.tool_use_id, ...image });
+              if (++imageCount >= MAX_TOOL_IMAGES) break;
+            }
+          }
+        }
         this.emit({ type: 'tool.done', toolCallId: r.tool_use_id, isError: r.is_error === true });
       }
     }
@@ -161,7 +201,7 @@ export class ClaudeStreamParser {
     if (o.subtype === 'error' || o.is_error) {
       this.emit({ type: 'turn.failed', ...safeFailure(String(o.result ?? 'claude error'), 'claude turn failed') });
     } else {
-      this.emit({ type: 'turn.completed', usage, costUsd });
+      this.emit({ type: 'turn.completed', usage, costUsd, model: this.model });
     }
   }
 }

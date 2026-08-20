@@ -48,6 +48,7 @@ check('verify: length mismatch (no throw) -> false', !verifyHookSecret(mkReq({ a
   const r2 = await run(reg, 's1', undefined);
   check('handle: missing secret -> 200', r2.status === 200);
   check('handle: missing secret -> deny (fail-closed)', r2.body?.hookSpecificOutput?.permissionDecision === 'deny');
+  check('handle: deny reason is neutral', r2.body?.hookSpecificOutput?.permissionDecisionReason === 'approval was not granted');
   check('handle: missing secret -> handler NOT invoked', !called);
 
   // wrong secret -> 200 deny
@@ -130,7 +131,7 @@ function mkReq(headers: Record<string, string>): IncomingMessage {
 
 interface RunResult {
   status: number | undefined;
-  body: { hookSpecificOutput?: { permissionDecision?: string } } | null;
+  body: { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } } | null;
 }
 
 async function run(reg: HookRegistry, sessionId: string, authHeader: string | undefined): Promise<RunResult> {

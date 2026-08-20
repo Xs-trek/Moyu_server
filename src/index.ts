@@ -8,9 +8,9 @@ import {
   runCheck,
   runToken,
   runPrintConfig,
-  runInit,
   runPair,
   runExit,
+  runInitLifecycle,
   runSelfCheck,
   ensureBackgroundGateway,
   VERSION,
@@ -37,6 +37,9 @@ import type { LogLevel } from './config/schema';
 import { getPlatform, getArch } from './util/platform';
 import { runHookRelay } from './approval/hook-relay';
 import { isCompiledBinary } from './util/runtime';
+import { selfCheckNeutralHookExecutable } from './approval/hook-executable';
+import { ArtifactStore } from './artifacts/store';
+import { initializePrivateRuntimeRoot } from './util/private-file';
 
 // D-1: global safety net. A single unhandled Promise rejection or uncaught exception must not
 // crash the whole gateway (taking down every active session). Log + degrade instead. This is the
@@ -55,6 +58,15 @@ async function main(options: RunOptions = {}): Promise<void> {
   // §3: materialize the embedded easytier-core (compiled single-binary mode) to
   // a temp path BEFORE the controller reads its bin. No-op in dev/source mode.
   await materializeEmbeddedBin();
+  // Fail at daemon startup, before accepting native CLI sessions, if the compiled binary
+  // cannot be exposed through a neutral local command path.
+  if (isCompiledBinary()) {
+    const localGuard = selfCheckNeutralHookExecutable();
+    if (!localGuard.ok) throw new Error('local approval guard is unavailable');
+  }
+  // Establish the exact private DACL/mode while the daemon is bootstrapping. Session creation
+  // then uses inherited children and never launches an ACL helper on a phone request.
+  initializePrivateRuntimeRoot();
   const config = loadConfig(options.configPath);
   if (options.logLevel) {
     // parseArgs already validated the level against debug|info|warn|error.
@@ -94,7 +106,8 @@ async function main(options: RunOptions = {}): Promise<void> {
 
   const adapters = new AdapterManager();
   const hooks = new HookRegistry();
-  const sessions = new SessionManager(adapters);
+  const artifacts = new ArtifactStore();
+  const sessions = new SessionManager(adapters, artifacts);
   const accounts = new AccountService();
 
   // §4: register only claude + codex by default. opencode is retained as interface code but
@@ -160,6 +173,11 @@ async function main(options: RunOptions = {}): Promise<void> {
     } catch (e) {
       log.warn('session disposal error', { err: String(e) });
     }
+    try {
+      artifacts.dispose();
+    } catch (e) {
+      log.warn('artifact cleanup error', { err: String(e) });
+    }
     if (server) {
       // Upgraded WebSocket connections can keep Server.close() pending. Give in-flight HTTP
       // responses a brief flush window, then exit; pairing/overlay/session cleanup is complete.
@@ -177,6 +195,7 @@ async function main(options: RunOptions = {}): Promise<void> {
     config,
     adapters,
     sessions,
+    artifacts,
     hooks,
     port,
     startedAt: new Date().toISOString(),
@@ -200,7 +219,7 @@ async function main(options: RunOptions = {}): Promise<void> {
     listen: `${config.gateway.bindHost}:${port}`,
     token: '[REDACTED]',
     hook: `http://127.0.0.1:${port}/hooks/pre-tool-use`,
-    ws: `ws://127.0.0.1:${port}/api/v1/ws?token=<token>`,
+    ws: `ws://127.0.0.1:${port}/api/v1/ws (Authorization: Bearer header required)`,
     configPath: '(see config.json)',
   });
   log.info('first-run: read token from config file to connect clients (or run `moyu -token`)');
@@ -228,11 +247,7 @@ async function entry(): Promise<void> {
     case 'selfcheck':
       process.exit(await runSelfCheck());
     case 'init':
-      if (await runInit(action.configPath)) process.exit(1);
-      // Re-running init may change the relay. Restart an existing daemon so the saved value is
-      // also the active runtime value; on first run this is a quiet no-op.
-      if (await runExit(action.configPath, true)) process.exit(1);
-      process.exit(await ensureBackgroundGateway({ configPath: action.configPath }));
+      process.exit(await runInitLifecycle(action.configPath));
     case 'pair': {
       const ready = await ensureBackgroundGateway({ configPath: action.configPath });
       if (ready !== 0) process.exit(ready);
@@ -240,7 +255,7 @@ async function entry(): Promise<void> {
     }
     case 'exit':
       process.exit(await runExit(action.configPath));
-    case 'hook-relay': {
+    case 'local-check': {
       process.exitCode = await runHookRelay(action.relayConfigPath);
       return;
     }

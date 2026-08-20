@@ -2,9 +2,8 @@
 // localhost PreToolUse command hook. Provider traffic and credentials remain inside
 // the user's Codex CLI; this backend only handles CLI JSONL and local approval events.
 import { spawn, type ChildProcess } from 'node:child_process';
-import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type {
   AdapterEvent,
@@ -22,12 +21,14 @@ import { readLines, which } from '../../util/spawn';
 import { log, registerEnvSecrets, categorizeError, safeStderrSummary, safeFailure } from '../../util/logger';
 import { isWindows } from '../../util/platform';
 import { terminateProcessTree } from '../../util/process';
+import { createPrivateRuntimeSubdirectory, writeFileInPrivateDirectory } from '../../util/private-file';
 import type { ApprovalPolicy, SandboxMode, ApprovalsReviewer } from '../../config/schema';
 import {
   buildCodexExecInvocation,
   buildCodexSpawnEnv,
   decodeCodexLine,
   relayTimeoutSecFor,
+  type NormalizedCodexImage,
   type NormalizedCodexItem,
 } from './protocol';
 
@@ -76,6 +77,10 @@ const CHOICES = ['allow', 'allow_session', 'deny', 'cancel'] as const;
 const STDERR_CAP = 64 * 1024;
 const MAX_PENDING_INPUTS = 32;
 const MAX_STREAM_TEXT_CHARS = 256 * 1024;
+// A standard MCP result may carry up to four in-band images in one JSONL event. Four 8 MiB
+// binaries occupy roughly 42.7 MiB as base64; keep the 48 MiB allowance local to Codex while
+// the shared reader remains at 2 MiB.
+export const CODEX_MAX_JSONL_LINE_CHARS = 48 * 1024 * 1024;
 
 function capStreamText(text: string): string {
   return text.length <= MAX_STREAM_TEXT_CHARS
@@ -85,7 +90,9 @@ function capStreamText(text: string): string {
 
 export class CodexSession implements SessionHandle {
   readonly sessionId: string;
-  readonly cliSessionRef: string;
+  /** Once Codex reports its native thread id, publish that authoritative id in summaries so
+   * native-history discovery can reconcile the live session instead of showing a second card. */
+  get cliSessionRef(): string { return this.threadId ?? this.initialCliSessionRef; }
   get model(): string | undefined { return this.opts.model; }
   get effort(): ReasoningEffort | undefined { return this.opts.effort; }
   private emit: (event: AdapterEvent) => void = () => {};
@@ -101,6 +108,7 @@ export class CodexSession implements SessionHandle {
   private interrupted = false;
   private itemTools = new Map<string, string>();
   private itemOutput = new Map<string, string>();
+  private itemImages = new Map<string, Set<string>>();
   private messageBuf = '';
   private thinkingBuf = '';
   private thinkingActive = false;
@@ -109,10 +117,11 @@ export class CodexSession implements SessionHandle {
   private hookConfigPath: string | null = null;
   private turnDispatchAt = 0;
   private firstVisibleEvent = false;
+  private readonly initialCliSessionRef: string;
 
   constructor(private opts: CodexSessionOpts) {
     this.sessionId = opts.sessionId;
-    this.cliSessionRef = opts.cliSessionRef;
+    this.initialCliSessionRef = opts.cliSessionRef;
     this.hookSecret = randomBytes(32).toString('hex');
     this.tracker = new ApprovalTracker(opts.approvalTimeoutSec, (approvalId, decision) => {
       this.emit({ type: 'approval.resolved', approvalId, decision });
@@ -141,9 +150,9 @@ export class CodexSession implements SessionHandle {
     const bin = this.opts.spawnBin ?? which('codex');
     if (!bin) throw new Error('codex CLI not found');
     registerEnvSecrets(process.env);
-    const dir = mkdtempSync(join(tmpdir(), 'moyu-codex-hook-'));
-    this.hookConfigPath = join(dir, 'relay.json');
-    writeFileSync(
+    const dir = createPrivateRuntimeSubdirectory();
+    this.hookConfigPath = join(dir, 'data.json');
+    writeFileInPrivateDirectory(
       this.hookConfigPath,
       JSON.stringify({
         port: this.opts.port,
@@ -151,7 +160,6 @@ export class CodexSession implements SessionHandle {
         secret: this.hookSecret,
         sessionId: this.sessionId,
       }),
-      { mode: 0o600 },
     );
     this.opts.hooks.register(
       this.sessionId,
@@ -187,6 +195,7 @@ export class CodexSession implements SessionHandle {
     this.stderrBuf = '';
     this.itemTools.clear();
     this.itemOutput.clear();
+    this.itemImages.clear();
     this.messageBuf = '';
     this.thinkingBuf = '';
     this.thinkingActive = false;
@@ -213,7 +222,7 @@ export class CodexSession implements SessionHandle {
         throw new Error('codex binary is a command shim; configure the native codex executable');
       }
 
-      const externalThread = this.cliSessionRef !== this.sessionId ? this.cliSessionRef : null;
+      const externalThread = this.initialCliSessionRef !== this.sessionId ? this.initialCliSessionRef : null;
       const threadId = externalThread ?? (this.hasThread ? this.threadId : null);
       const invocation = buildCodexExecInvocation(
         {
@@ -231,7 +240,7 @@ export class CodexSession implements SessionHandle {
         threadId,
       );
       const args = this.opts.spawnArgs ?? invocation.args;
-      const env = buildCodexSpawnEnv(this.opts.profileEnv);
+      const env = buildCodexSpawnEnv(this.opts.profileEnv, process.env, this.opts.cwd);
       registerEnvSecrets(env);
 
       this.emit({ type: 'turn.started' });
@@ -267,7 +276,7 @@ export class CodexSession implements SessionHandle {
       });
 
       if (child.stdout) {
-        for await (const line of readLines(child.stdout)) {
+        for await (const line of readLines(child.stdout, CODEX_MAX_JSONL_LINE_CHARS)) {
           if (this.disposed) break;
           const decoded = decodeCodexLine(line);
           if (
@@ -381,6 +390,7 @@ export class CodexSession implements SessionHandle {
     const toolCallId = randomUUID();
     this.itemTools.set(itemKey, toolCallId);
     this.itemOutput.set(itemKey, '');
+    this.itemImages.set(itemKey, new Set());
     this.emit({ type: 'tool.start', toolCallId, tool, input });
     return toolCallId;
   }
@@ -396,10 +406,36 @@ export class CodexSession implements SessionHandle {
     this.itemOutput.set(itemKey, output);
   }
 
+  /** Codex item updates are snapshots. Emit each distinct image at most once and retain no more
+   * than four across the tool call, after its text output. Hashes avoid retaining a second base64
+   * copy merely for deduplication. */
+  private emitToolImages(itemKey: string, toolCallId: string, images: readonly NormalizedCodexImage[] | undefined): void {
+    if (!images?.length) return;
+    let emitted = this.itemImages.get(itemKey);
+    if (!emitted) {
+      emitted = new Set();
+      this.itemImages.set(itemKey, emitted);
+    }
+    for (const image of images) {
+      if (emitted.size >= 4) break;
+      const signature = createHash('sha256').update(image.mime).update('\0').update(image.base64).digest('hex');
+      if (emitted.has(signature)) continue;
+      emitted.add(signature);
+      this.emit({
+        type: 'tool.output',
+        toolCallId,
+        base64: image.base64,
+        mime: image.mime,
+        name: image.name,
+      });
+    }
+  }
+
   private finishTool(itemKey: string, toolCallId: string, isError: boolean): void {
     this.emit({ type: 'tool.done', toolCallId, isError });
     this.itemTools.delete(itemKey);
     this.itemOutput.delete(itemKey);
+    this.itemImages.delete(itemKey);
   }
 
   private handleItem(item: NormalizedCodexItem | undefined, phase: string): void {
@@ -436,7 +472,16 @@ export class CodexSession implements SessionHandle {
       const name = 'MCP:' + item.server + '/' + item.tool;
       const toolCallId = this.ensureTool(key, name, item.input);
       if (item.output) this.emitToolOutput(key, toolCallId, item.output);
+      this.emitToolImages(key, toolCallId, item.images);
       if (phase === 'item.completed') this.finishTool(key, toolCallId, item.status === 'failed');
+      return;
+    }
+    const key = item.id || item.wireType;
+    const toolCallId = this.ensureTool(key, 'CLI:' + item.wireType, item.input);
+    if (item.output) this.emitToolOutput(key, toolCallId, item.output);
+    this.emitToolImages(key, toolCallId, item.images);
+    if (phase === 'item.completed') {
+      this.finishTool(key, toolCallId, item.status === 'failed' || item.status === 'declined');
     }
   }
 

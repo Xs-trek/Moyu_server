@@ -25,7 +25,9 @@ export class OpencodeAdapter implements Adapter {
     },
     configuration: {
       model: true,
+      modelSelection: 'freeform' as const,
       effortLevels: [] as const,
+      permissionModes: [] as const,
       sandboxModes: [] as const,
       reviewers: [] as const,
     },

@@ -2,11 +2,13 @@
 //
 // Keep argv/TOML construction and JSONL wire-shape normalization here so a future Codex
 // protocol update does not disturb session lifecycle, approval tracking or gateway code.
-import { fileURLToPath } from 'node:url';
 import type { ApprovalPolicy, ApprovalsReviewer, SandboxMode } from '../../config/schema';
 import type { Usage } from '../types';
 import type { ReasoningEffort } from '../types';
-import { isCompiledBinary } from '../../util/runtime';
+import { hookRelayCommands, relayTimeoutSecFor } from '../../approval/hook-command';
+import { scrubMoyuEnv } from '../../util/runtime';
+
+export { hookRelayCommands, hookRelayExec, relayTimeoutSecFor } from '../../approval/hook-command';
 
 export const CODEX_PROTOCOL_MAJOR = 0;
 export const CODEX_PROTOCOL_MINOR = 146;
@@ -25,7 +27,7 @@ export interface CodexProtocolOptions {
   sandbox: SandboxMode;
   approvalsReviewer: ApprovalsReviewer;
   approvalTimeoutSec: number;
-  /** Mode-0600 local descriptor consumed by the hidden hook relay. The path, rather than
+  /** Mode-0600 local descriptor consumed by the hidden local check. The path, rather than
    * credentials, is placed in the command hook; no moyu variables enter the CLI env. */
   hookConfigPath: string;
 }
@@ -35,41 +37,6 @@ export interface CodexExecInvocation {
   stdin: string;
   hookTimeoutSec: number;
   relayTimeoutSec: number;
-}
-
-function quotePosix(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-function quoteCmd(value: string): string {
-  return `"${value.replace(/"/g, '""')}"`;
-}
-
-/** Build an exact command for both shells. Source mode passes node, tsx and the entry as
- * separate quoted arguments; quote characters are never stored in an env var and therefore
- * cannot become literal argv on POSIX shells. */
-export function hookRelayCommands(configPath: string): { unix: string; windows: string } {
-  const args = isCompiledBinary()
-    ? [process.execPath, 'hook-relay', configPath]
-    : [
-        process.execPath,
-        fileURLToPath(new URL('../../../node_modules/tsx/dist/cli.mjs', import.meta.url)),
-        fileURLToPath(new URL('../../index.ts', import.meta.url)),
-        'hook-relay',
-        configPath,
-      ];
-  return {
-    unix:
-      args.map(quotePosix).join(' ') + ' || ' +
-      '{ echo "blocked: hook relay unavailable" >&2; exit 2; }',
-    windows:
-      args.map(quoteCmd).join(' ') + ' || ' +
-      '(echo blocked: hook relay unavailable 1>&2 & exit /b 2)',
-  };
-}
-
-export function relayTimeoutSecFor(approvalTimeoutSec: number): number {
-  return approvalTimeoutSec + 10;
 }
 
 function hookConfigOverride(approvalTimeoutSec: number, configPath: string): { config: string; hookTimeoutSec: number; relayTimeoutSec: number } {
@@ -89,7 +56,7 @@ function hookConfigOverride(approvalTimeoutSec: number, configPath: string): { c
  * cannot be parsed as an option, leak through the process list, or hit OS argv length limits. */
 export function buildCodexExecInvocation(
   opts: CodexProtocolOptions,
-  input: { text: string },
+  input: { text: string; attachments?: { path?: string }[] },
   threadId: string | null,
 ): CodexExecInvocation {
   const hook = hookConfigOverride(opts.approvalTimeoutSec, opts.hookConfigPath);
@@ -106,7 +73,7 @@ export function buildCodexExecInvocation(
   if (opts.effort) args.push('-c', 'model_reasoning_effort=' + opts.effort);
 
   // codex exec is headless and forces native approval_policy=never. State that explicitly;
-  // gateway approvalPolicy is enforced by the PreToolUse relay. The reviewer setting is still
+  // local approvalPolicy is enforced by the PreToolUse check. The reviewer setting is still
   // forwarded as adapter configuration, but it never replaces the relay transport.
   args.push('-c', 'approval_policy=never');
   args.push('-c', 'approvals_reviewer=' + opts.approvalsReviewer);
@@ -115,15 +82,24 @@ export function buildCodexExecInvocation(
 
   // Parent exec options must precede the resume subcommand. Only a small subset of flags is
   // global after resume in 0.146.
-  if (threadId) args.push('resume', threadId, '-');
-  else args.push('-');
+  const imagePaths = (input.attachments ?? []).flatMap((attachment) => attachment.path ? [attachment.path] : []);
+  if (threadId) {
+    args.push('resume', threadId);
+    // In Codex 0.146 `resume --image` belongs to ResumeArgs (not the parent exec parser).
+    for (const path of imagePaths) args.push('--image', path);
+    args.push('-');
+  } else {
+    // New-turn images are part of SharedCliOptions and must precede the stdin prompt marker.
+    for (const path of imagePaths) args.push('--image', path);
+    args.push('-');
+  }
   return { args, stdin: input.text, hookTimeoutSec: hook.hookTimeoutSec, relayTimeoutSec: hook.relayTimeoutSec };
 }
 
 /** Compatibility wrapper kept for tests/consumers that only inspect argv. */
 export function buildCodexExecArgs(
   opts: CodexProtocolOptions,
-  input: { text: string },
+  input: { text: string; attachments?: { path?: string }[] },
   threadId: string | null,
 ): string[] {
   return buildCodexExecInvocation(opts, input, threadId).args;
@@ -131,19 +107,28 @@ export function buildCodexExecArgs(
 
 /** Merge the native environment and selected profile. Hook routing is intentionally absent:
  * a normal CLI tool subprocess must not inherit any moyu integration marker or secret. */
-export function buildCodexSpawnEnv(profileEnv: Record<string, string> | undefined): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    ...(profileEnv ?? {}),
-  };
+export function buildCodexSpawnEnv(
+  profileEnv: Record<string, string> | undefined,
+  inherited: NodeJS.ProcessEnv = process.env,
+  childCwd?: string,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...inherited };
   if (profileEnv?.CODEX_HOME) {
+    // A selected CODEX_HOME is an account boundary. Remove standard inherited credentials
+    // before applying the selected *.home values so OAuth/API-key profiles cannot be silently
+    // overridden by the shell that launched the daemon.
+    delete env.OPENAI_API_KEY;
     delete env.CODEX_API_KEY;
     delete env.CODEX_ACCESS_TOKEN;
   }
-  for (const key of Object.keys(env)) {
-    if (key.startsWith('RD_HOOK_') || key.startsWith('MOYU_') || key === 'REMOTE_DASHBOARD_CONFIG') delete env[key];
-  }
-  return env;
+  Object.assign(env, profileEnv ?? {});
+  return scrubMoyuEnv(env, undefined, childCwd);
+}
+
+export interface NormalizedCodexImage {
+  base64: string;
+  mime: string;
+  name?: string;
 }
 
 export type NormalizedCodexItem =
@@ -151,8 +136,8 @@ export type NormalizedCodexItem =
   | { kind: 'reasoning'; id: string; text: string }
   | { kind: 'command_execution'; id: string; command: string; output: string; status?: string }
   | { kind: 'file_change'; id: string; changes: unknown; status?: string }
-  | { kind: 'mcp_tool_call'; id: string; server: string; tool: string; input: unknown; output?: string; status?: string }
-  | { kind: 'other'; id: string; wireType: string };
+  | { kind: 'mcp_tool_call'; id: string; server: string; tool: string; input: unknown; output?: string; images?: NormalizedCodexImage[]; status?: string }
+  | { kind: 'other'; id: string; wireType: string; input: unknown; output?: string; images?: NormalizedCodexImage[]; status?: string };
 
 export interface NormalizedCodexEvent {
   type: string;
@@ -166,6 +151,83 @@ function extractText(content: unknown): string | undefined {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return undefined;
   return content.map((part) => (typeof part === 'string' ? part : (part as { text?: string })?.text ?? '')).join('');
+}
+
+const MAX_TOOL_IMAGES = 4;
+const MAX_CONTENT_BLOCKS_SCANNED = 256;
+const MAX_IMAGE_BASE64_CHARS = Math.ceil((8 * 1024 * 1024) / 3) * 4;
+const MAX_IMAGE_MIME_CHARS = 128;
+const MAX_IMAGE_NAME_CHARS = 160;
+
+function contentBlocks(value: unknown): unknown[] | undefined {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'object') return undefined;
+  const content = (value as Record<string, unknown>).content;
+  return Array.isArray(content) ? content : undefined;
+}
+
+/** Extract only the standard in-band image shape. MIME support and canonical base64/magic-byte
+ * validation remain the ArtifactStore's responsibility so unsupported blocks degrade locally. */
+function extractToolImages(...values: unknown[]): NormalizedCodexImage[] | undefined {
+  const images: NormalizedCodexImage[] = [];
+  let scanned = 0;
+  for (const value of values) {
+    const blocks = contentBlocks(value);
+    if (!blocks) continue;
+    for (const block of blocks) {
+      if (scanned++ >= MAX_CONTENT_BLOCKS_SCANNED || images.length >= MAX_TOOL_IMAGES) break;
+      if (!block || typeof block !== 'object') continue;
+      const image = block as Record<string, unknown>;
+      if (image.type !== 'image') continue;
+      const base64 = typeof image.data === 'string'
+        ? image.data
+        : typeof image.base64 === 'string'
+          ? image.base64
+          : undefined;
+      const mimeValue = typeof image.mimeType === 'string'
+        ? image.mimeType
+        : typeof image.mime_type === 'string'
+          ? image.mime_type
+          : undefined;
+      if (!base64 || base64.length > MAX_IMAGE_BASE64_CHARS || !mimeValue) continue;
+      const mime = mimeValue.trim().slice(0, MAX_IMAGE_MIME_CHARS);
+      if (!mime) continue;
+      const rawName = typeof image.name === 'string'
+        ? image.name
+        : typeof image.filename === 'string'
+          ? image.filename
+          : undefined;
+      const name = rawName?.slice(0, MAX_IMAGE_NAME_CHARS);
+      images.push({ base64, mime, ...(name ? { name } : {}) });
+    }
+    if (scanned >= MAX_CONTENT_BLOCKS_SCANNED || images.length >= MAX_TOOL_IMAGES) break;
+  }
+  return images.length ? images : undefined;
+}
+
+/** Preserve the prior JSON text output for non-image results, but never copy a large in-band
+ * base64 payload into the text event/replay ring after it has been extracted as an artifact. */
+function withoutImagePayloads(value: unknown): unknown {
+  const blocks = contentBlocks(value);
+  if (!blocks) return value;
+  const content = blocks.map((block) => {
+    if (!block || typeof block !== 'object' || (block as Record<string, unknown>).type !== 'image') return block;
+    const copy = { ...(block as Record<string, unknown>) };
+    delete copy.data;
+    delete copy.base64;
+    return copy;
+  });
+  if (Array.isArray(value)) return content;
+  return { ...(value as Record<string, unknown>), content };
+}
+
+function stringifyToolOutput(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return JSON.stringify(withoutImagePayloads(value));
+  } catch {
+    return '[unserializable output]';
+  }
 }
 
 function mapUsage(value: unknown): Usage | undefined {
@@ -208,11 +270,31 @@ function normalizeItem(raw: unknown): NormalizedCodexItem | undefined {
       server: String(item.server ?? ''),
       tool: String(item.tool ?? ''),
       input: item.arguments ?? {},
-      output: result === undefined ? undefined : JSON.stringify(result),
+      output: stringifyToolOutput(result),
+      images: extractToolImages(item.result, item.output),
       status: item.status as string | undefined,
     };
   }
-  return { kind: 'other', id, wireType };
+  // Codex adds item types over time. Preserve unknown tool-like items as a generic unified tool
+  // instead of silently dropping them; known message/reasoning shapes were handled above.
+  const outputValue = item.output ?? item.result ?? item.error ?? item.aggregated_output ?? item.aggregatedOutput;
+  let output: string | undefined;
+  if (typeof outputValue === 'string') output = outputValue;
+  else output = stringifyToolOutput(outputValue);
+  const inputValue = item.input ?? item.arguments ?? (() => {
+    const copy: Record<string, unknown> = { ...item };
+    for (const key of ['id', 'type', 'status', 'output', 'result', 'error', 'aggregated_output', 'aggregatedOutput']) delete copy[key];
+    return copy;
+  })();
+  return {
+    kind: 'other',
+    id,
+    wireType: wireType || 'unknown_item',
+    input: inputValue,
+    output,
+    images: extractToolImages(item.output, item.result),
+    status: typeof item.status === 'string' ? item.status : undefined,
+  };
 }
 
 export function decodeCodexLine(line: string): NormalizedCodexEvent | null {

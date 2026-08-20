@@ -27,7 +27,7 @@ import { log } from '../util/logger';
 const BASE32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 const CODE_LEN = 8;
 const MAX_ATTEMPTS = 5;
-const PAIR_TIMEOUT_MS = 5 * 60 * 1000; // < 600s claude-hook spirit; fail-closed.
+const PAIR_TIMEOUT_MS = 5 * 60 * 1000; // Bounded one-time pairing window.
 
 // Pairing overlay constants (protocol-fixed; the phone app hardcodes these too).
 const PAIR_NETWORK_NAME = 'rd-pair';

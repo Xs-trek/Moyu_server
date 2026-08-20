@@ -88,6 +88,31 @@ function build() {
     process.exit(1);
   }
 
+  // Use the installed Node runtime for tsx even when this build script itself is hosted by Bun;
+  // Bun's preload semantics are not compatible with tsx's Node loader.
+  const nodeExecutable = process.platform === 'win32' ? 'node.exe' : 'node';
+  console.log('#3: provider-surface differential gate (test/unit-provider-surface.ts)');
+  const providerSurface = spawnSync(
+    nodeExecutable,
+    [join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs'), join(ROOT, 'test', 'unit-provider-surface.ts')],
+    { cwd: ROOT, stdio: 'inherit' },
+  );
+  if (providerSurface.status !== 0) {
+    console.error(`#3: provider-surface differential gate FAILED (exit ${providerSurface.status}) -- refusing to build`);
+    process.exit(1);
+  }
+
+  console.log('#3: native CLI surface gate (test/unit-hook-command.ts)');
+  const hookSurface = spawnSync(
+    nodeExecutable,
+    [join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs'), join(ROOT, 'test', 'unit-hook-command.ts')],
+    { cwd: ROOT, stdio: 'inherit' },
+  );
+  if (hookSurface.status !== 0) {
+    console.error(`#3: native CLI surface gate FAILED (exit ${hookSurface.status}) -- refusing to build`);
+    process.exit(1);
+  }
+
   const isNative = target === hostTarget();
   const vendor = vendorBinary(target);
   if (!existsSync(vendor)) {
@@ -128,8 +153,9 @@ function build() {
   );
 
   const outExt = TARGETS[target].exe ? '.exe' : '';
-  const outfile = join(ROOT, 'dist', `moyu${outExt}`);
-  mkdirSync(join(ROOT, 'dist'), { recursive: true });
+  const distDir = join(ROOT, 'dist');
+  const outfile = join(distDir, `moyu${outExt}`);
+  mkdirSync(distDir, { recursive: true });
 
   const compileArgs = ['build', '--compile', join(buildDir, 'entry.ts'), '--outfile', outfile];
   if (!isNative) compileArgs.push('--target', TARGETS[target].triple);
@@ -150,20 +176,28 @@ function build() {
 
   if (selfcheck && isNative) {
     // §3 "single artifact, no external bin/PATH" smoke: run the compiled binary
-    // from a TEMP cwd with a stripped PATH (no bin/) and confirm the EMBEDDED
-    // easytier-core spawns. Only meaningful for a native build (a foreign-arch
-    // binary can't execute on this host).
-    const tmpCwd = join(os.tmpdir(), `moyu-selfcheck-${process.pid}`);
+    // from a TEMP cwd with a stripped PATH and confirm both the embedded network
+    // core and the neutral local command alias can spawn. Only meaningful for a
+    // native build (a foreign-arch binary can't execute on this host).
+    // Keep the smoke cwd on the repository volume. On Windows, the compiled artifact may be
+    // launched under a sandbox/job that denies nested ACL helpers when cwd is the OS TEMP root;
+    // the runtime helper itself still materializes and executes from OS TEMP, so this does not
+    // weaken the self-contained or stripped-PATH proof.
+    const tmpCwd = join(distDir, `.artifact-check-${process.pid}`);
+    // Remove a stale same-PID directory from an interrupted prior build before recreating it.
+    rmSync(tmpCwd, { recursive: true, force: true });
     mkdirSync(tmpCwd, { recursive: true });
-    const minimalPath = os.platform() === 'win32' ? `${process.env.SystemRoot}\\System32` : '/usr/bin';
-    const sc = spawnSync(outfile, ['--selfcheck'], {
-      cwd: tmpCwd,
-      env: { ...process.env, PATH: minimalPath },
-      stdio: 'inherit',
-    });
+    const minimalPath = os.platform() === 'win32'
+      ? `${process.env.SystemRoot}\\System32;${process.env.SystemRoot}\\System32\\WindowsPowerShell\\v1.0`
+      : '/usr/bin';
+    const checkEnv = Object.fromEntries(
+      Object.entries({ ...process.env, PATH: minimalPath })
+        .filter(([key]) => !key.toUpperCase().startsWith('BUN_')),
+    );
+    const sc = spawnSync(outfile, ['--selfcheck'], { cwd: tmpCwd, env: checkEnv, stdio: 'inherit' });
     rmSync(tmpCwd, { recursive: true, force: true });
     if (sc.status !== 0) {
-      console.error(`§3: selfcheck FAILED (exit ${sc.status}) -- the compiled artifact could not spawn its embedded easytier-core`);
+      console.error(`§3: selfcheck FAILED (exit ${sc.status}) -- compiled runtime helpers are unavailable`);
       process.exit(1);
     }
     console.log(`§3: selfcheck OK (artifact is self-contained: ${outfile})`);
