@@ -24,8 +24,16 @@ export function resolveCodexConfigDir(configured?: string): string {
  *  Used for codexHome profiles: the dir's auth.json is user-pre-created via
  *  `CODEX_HOME=<dir> codex login`. Does NOT consult process.env -- a codexHome profile's
  *  auth is the directory, not the shell. */
-export function readCodexAuthAt(dir: string, base?: AuthProfile): AuthProfile {
+export function readCodexAuthAt(
+  dir: string,
+  base?: AuthProfile,
+  env: NodeJS.ProcessEnv = {},
+): AuthProfile {
   const profile: AuthProfile = base ?? { adapter: 'codex', mode: 'none', hasCredentials: false };
+  if (env.OPENAI_API_KEY) {
+    profile.mode = 'apiKey';
+    profile.hasCredentials = true;
+  }
   const authPath = join(dir, 'auth.json');
   if (existsSync(authPath)) {
     try {
@@ -46,6 +54,15 @@ export function readCodexAuthAt(dir: string, base?: AuthProfile): AuthProfile {
       if (/openai_base_url|base_url\s*=|model_providers/.test(t)) {
         profile.baseUrlPresent = true;
       }
+      const providerEnvKeys = [...t.matchAll(/\benv_key\s*=\s*["']([A-Za-z_][A-Za-z0-9_]*)["']/g)]
+        .map((match) => match[1]!);
+      if (providerEnvKeys.some((key) => !!env[key]) || /\bexperimental_bearer_token\s*=/.test(t)) {
+        profile.mode = 'apiKey';
+        profile.hasCredentials = true;
+      } else if (/\[model_providers\.[^\]]+\.auth\]|\bauth\.command\s*=/.test(t)) {
+        profile.mode = 'providerKey';
+        profile.hasCredentials = true;
+      }
     } catch {
       // best-effort
     }
@@ -58,11 +75,5 @@ export function detectCodexAuth(configuredDir?: string): AuthProfile {
   const profile: AuthProfile = { adapter: 'codex', mode: 'none', hasCredentials: false };
   profile.proxyDetected = !!(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.ALL_PROXY);
 
-  if (process.env.OPENAI_API_KEY) {
-    profile.mode = 'apiKey';
-    profile.hasCredentials = true;
-    return profile;
-  }
-
-  return readCodexAuthAt(resolveCodexConfigDir(configuredDir), profile);
+  return readCodexAuthAt(resolveCodexConfigDir(configuredDir), profile, process.env);
 }

@@ -69,6 +69,52 @@ if (scenario === 'text+tool' || scenario === 'tool-failed') {
   emit({ type: 'item.completed', item: { id: 'mcp-1', type: 'mcp_tool_call', server: 'demo', tool: 'lookup', arguments: { q: 'x' }, result: { ok: true }, status: 'completed' } });
   emit({ type: 'turn.completed', usage: { input_tokens: 3, output_tokens: 4 } });
   process.exit(0);
+} else if (scenario === 'generic-tool') {
+  emit({ type: 'thread.started', thread_id: THREAD_ID });
+  emit({ type: 'turn.started', turn_id: 'mock-turn-1' });
+  emit({ type: 'item.started', item: { id: 'web-1', type: 'web_search', input: { query: 'docs' }, status: 'in_progress' } });
+  emit({ type: 'item.completed', item: { id: 'web-1', type: 'web_search', input: { query: 'docs' }, result: { hits: 2 }, status: 'completed' } });
+  emit({ type: 'turn.completed', usage: { input_tokens: 2, output_tokens: 1 } });
+  process.exit(0);
+} else if (scenario === 'image-tools') {
+  const png = 'iVBORw0KGgo=';
+  const jpeg = '/9j/';
+  const gif = 'R0lGODlh';
+  const unknown = 'SUkqAA==';
+  const fifth = 'RklGVEg=';
+  emit({ type: 'thread.started', thread_id: THREAD_ID });
+  emit({ type: 'turn.started', turn_id: 'mock-turn-1' });
+  emit({ type: 'item.started', item: { id: 'mcp-image', type: 'mcp_tool_call', server: 'browser', tool: 'screenshot', arguments: {}, status: 'in_progress' } });
+  emit({
+    type: 'item.updated',
+    item: {
+      id: 'mcp-image', type: 'mcp_tool_call', server: 'browser', tool: 'screenshot', arguments: {}, status: 'in_progress',
+      result: { content: [
+        { type: 'text', text: 'captured' },
+        { type: 'image', data: png, mimeType: 'image/png', name: 'screen.png' },
+      ] },
+    },
+  });
+  emit({
+    type: 'item.completed',
+    item: {
+      id: 'mcp-image', type: 'mcp_tool_call', server: 'browser', tool: 'screenshot', arguments: {}, status: 'completed',
+      result: { content: [
+        { type: 'text', text: 'captured' },
+        { type: 'image', data: png, mimeType: 'image/png', name: 'screen.png' },
+        { type: 'image', base64: jpeg, mime_type: 'image/jpeg', filename: 'photo.jpg' },
+        { type: 'image', data: gif, mimeType: 'image/gif' },
+        { type: 'image', base64: unknown, mime_type: 'image/tiff' },
+        { type: 'image', data: fifth, mimeType: 'image/webp' },
+      ] },
+    },
+  });
+  emit({ type: 'item.started', item: { id: 'generic-output-image', type: 'browser_capture', input: {}, status: 'in_progress' } });
+  emit({ type: 'item.completed', item: { id: 'generic-output-image', type: 'browser_capture', input: {}, output: { content: [{ type: 'image', base64: jpeg, mime_type: 'image/jpeg' }] }, status: 'completed' } });
+  emit({ type: 'item.started', item: { id: 'generic-result-image', type: 'browser_result', input: {}, status: 'in_progress' } });
+  emit({ type: 'item.completed', item: { id: 'generic-result-image', type: 'browser_result', input: {}, result: { content: [{ type: 'image', data: gif, mimeType: 'image/gif' }] }, status: 'completed' } });
+  emit({ type: 'turn.completed', usage: { input_tokens: 2, output_tokens: 1 } });
+  process.exit(0);
 } else if (scenario === 'hang') {
   // Emits turn.started then stays alive until killed (#5 dispose-awaits-exit test).
   emit({ type: 'thread.started', thread_id: THREAD_ID });

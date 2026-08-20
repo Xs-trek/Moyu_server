@@ -8,6 +8,7 @@ import type { PairingService } from './net/pairing';
 import type { AccountService } from './accounts/service';
 import type { NetNotifier } from './api/ws';
 import type { InboundPolicy, NetStatus } from './net/types';
+import type { ArtifactStore } from './artifacts/store';
 
 export interface NetStatusProvider {
   getStatus(): Promise<NetStatus>;
@@ -23,6 +24,7 @@ export interface ServerContext {
   config: AppConfig;
   adapters: AdapterManager;
   sessions: SessionManager;
+  artifacts: ArtifactStore;
   hooks: HookRegistry;
   port: number;
   startedAt: string;

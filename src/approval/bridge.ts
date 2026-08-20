@@ -1,6 +1,6 @@
 // Approval bridge (A5): maps unified ApprovalDecision -> each adapter's native
 // approval shape (design §5.3), plus a fail-closed timeout tracker.
-// Security: approval timeout < 600s (claude hook hard limit); default deny on timeout.
+// Security: the public timeout is bounded by config validation; every timeout defaults to deny.
 import type { ApprovalDecision } from '../adapters/types';
 import { log } from '../util/logger';
 
@@ -13,28 +13,31 @@ export interface ClaudeHookResponse {
     // reliably honored -> allow/deny ignored -> fail-open. Must match the gateway DENY constant.
     hookEventName: 'PreToolUse';
     permissionDecision: 'allow' | 'deny';
+    permissionDecisionReason?: string;
     updatedInput?: unknown;
   };
 }
 
 export type OpencodeReply = 'once' | 'always' | 'reject';
 
-function isModification(d: ApprovalDecision): d is { allowWithModification?: unknown } {
+function isModification(d: ApprovalDecision): d is { allowWithModification: { answers: Record<string, string | string[]> } } {
   return typeof d === 'object' && d !== null && 'allowWithModification' in d;
 }
 
-export function toClaude(d: ApprovalDecision): ClaudeHookResponse {
+/** Map a decision to Claude's command-hook JSON. Echoing the original tool input on an allow
+ * also lets the shared relay reject malformed/truncated allow responses before they reach CLI. */
+export function toClaude(d: ApprovalDecision, toolInput: unknown = {}): ClaudeHookResponse {
   if (isModification(d) && d.allowWithModification !== undefined) {
     return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', updatedInput: d.allowWithModification } };
   }
   switch (d) {
     case 'allow':
     case 'allow_session':
-      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' } };
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', updatedInput: toolInput } };
     case 'deny':
     case 'cancel':
     default:
-      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny' } };
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'approval was not granted' } };
   }
 }
 
@@ -82,7 +85,7 @@ export function toCodexHook(d: ApprovalDecision, toolInput: unknown): CodexHookR
     case 'deny':
     case 'cancel':
     default:
-      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'denied by remote operator' } };
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'approval was not granted' } };
   }
 }
 

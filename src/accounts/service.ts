@@ -34,6 +34,8 @@ import type {
 import { configPath, saveConfig } from '../config/loader';
 import { detectClaudeAuth } from '../adapters/claude/auth';
 import { detectCodexAuth, readCodexAuthAt } from '../adapters/codex/auth';
+import { resolveCliDefaultModel, resolveEffectiveModel } from '../adapters/effective-model';
+import { normalizeConfigPath } from '../adapters/config-location';
 import { log } from '../util/logger';
 
 /** Adapters that participate in account/profile switching. */
@@ -72,7 +74,7 @@ function readEnvFile(path: string): Record<string, string> {
       ) {
         val = val.slice(1, -1);
       }
-      if (key) out[key] = val;
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) out[key] = val;
     }
   } catch (e) {
     log.warn('accounts: env file unreadable', { path, err: String(e) });
@@ -80,35 +82,54 @@ function readEnvFile(path: string): Record<string, string> {
   return out;
 }
 
-/** Read a *.home file (codex): first non-empty/non-comment line = CODEX_HOME dir path. 0-modify. */
-function readHomeFile(path: string): string | undefined {
+/** Read a Codex *.home file without retaining credentials in profile state. Backward-compatible
+ * format: the first bare line is CODEX_HOME. A `CODEX_HOME=<path>` line is also accepted, and
+ * subsequent KEY=VALUE entries supply custom provider env_key values to the native CLI. */
+function readCodexHomeFile(path: string): { dir: string; env: Record<string, string> } | undefined {
   try {
     const text = readFileSync(path, 'utf8');
-    const line = text
+    const env = readEnvFile(path);
+    const barePath = text
       .split(/\r?\n/)
       .map((l) => l.trim())
-      .find((l) => l && !l.startsWith('#'));
-    return line || undefined;
+      .find((line) => line && !line.startsWith('#') && !line.startsWith('export ') && !line.includes('='));
+    const selected = env.CODEX_HOME || barePath;
+    if (!selected) return undefined;
+    const dir = normalizeConfigPath(selected);
+    return { dir, env: { ...env, CODEX_HOME: dir } };
   } catch (e) {
     log.warn('accounts: home file unreadable', { path, err: String(e) });
     return undefined;
   }
 }
 
-function inferEnvFileAuthMode(adapter: SwitchableAdapter, env: Record<string, string>): AuthMode {
+function detectClaudeEnvFile(
+  env: Record<string, string>,
+  configuredDir?: string,
+): ReturnType<typeof detectClaudeAuth> {
+  // Spawn precedence is profile CLAUDE_CONFIG_DIR > adapter configDir > daemon environment.
+  // Pass only the profile env to auth detection so a native shell API key/token cannot make an
+  // OAuth-directory profile report the wrong account. The resolved directory is explicit, so
+  // settings.json and .credentials.json are still inspected read-only.
+  const effectiveDir = env.CLAUDE_CONFIG_DIR ?? configuredDir ?? process.env.CLAUDE_CONFIG_DIR;
+  return detectClaudeAuth(effectiveDir, env);
+}
+
+function inferEnvFileAuthMode(
+  adapter: SwitchableAdapter,
+  env: Record<string, string>,
+  configuredDir?: string,
+): AuthMode {
   if (adapter === 'claude') {
-    if (env.CLAUDE_CODE_USE_BEDROCK === '1' || env.CLAUDE_CODE_USE_VERTEX === '1') return 'providerKey';
-    if (env.ANTHROPIC_AUTH_TOKEN) return 'authToken+BaseUrl';
-    if (env.ANTHROPIC_API_KEY) return 'apiKey';
-    return 'none';
+    return detectClaudeEnvFile(env, configuredDir).mode as AuthMode;
   }
   // codex envFile is no longer discovered (codex uses *.home/CODEX_HOME); kept for completeness.
   if (env.OPENAI_API_KEY) return 'apiKey';
   return 'none';
 }
 
-function inferCodexHomeAuthMode(dir: string): AuthMode {
-  const d = readCodexAuthAt(dir);
+function inferCodexHomeAuthMode(dir: string, env: Record<string, string>): AuthMode {
+  const d = readCodexAuthAt(dir, undefined, env);
   return (d.mode === 'none' ? 'none' : d.mode) as AuthMode;
 }
 
@@ -168,14 +189,14 @@ export class AccountService {
         const path = join(dir, f);
         const name = f.slice(0, -ext.length);
         if (adapter === 'codex') {
-          const homeDir = readHomeFile(path);
-          if (!homeDir) continue;
+          const home = readCodexHomeFile(path);
+          if (!home) continue;
           profiles.push({
             id: `codex:home:${name}`,
             name,
             adapter,
-            authMode: inferCodexHomeAuthMode(homeDir),
-            source: { kind: 'codexHome', dir: homeDir },
+            authMode: inferCodexHomeAuthMode(home.dir, home.env),
+            source: { kind: 'codexHome', dir: home.dir, path },
           });
         } else {
           const env = readEnvFile(path);
@@ -183,7 +204,7 @@ export class AccountService {
             id: `${adapter}:env:${name}`,
             name,
             adapter,
-            authMode: inferEnvFileAuthMode(adapter, env),
+            authMode: inferEnvFileAuthMode(adapter, env, cfg?.adapters[adapter].configDir),
             source: { kind: 'envFile', path },
           });
         }
@@ -197,7 +218,11 @@ export class AccountService {
   resolveEnv(profile: AccountProfile): Record<string, string> {
     if (profile.source.kind === 'nativeDefault') return {};
     if (profile.source.kind === 'envFile') return profile.source.path ? readEnvFile(profile.source.path) : {};
-    if (profile.source.kind === 'codexHome') return profile.source.dir ? { CODEX_HOME: profile.source.dir } : {};
+    if (profile.source.kind === 'codexHome') {
+      if (!profile.source.dir) return {};
+      const current = profile.source.path ? readCodexHomeFile(profile.source.path) : undefined;
+      return current?.env ?? { CODEX_HOME: profile.source.dir };
+    }
     return {};
   }
 
@@ -238,7 +263,7 @@ export class AccountService {
     if (profile.source.kind === 'codexHome') {
       // codex auth is OAuth (tokens) or apiKey (OPENAI_API_KEY in auth.json); authToken/provider
       // are claude-only concepts. baseUrl comes from the dir's config.toml (readCodexAuthAt).
-      const d = profile.source.dir ? readCodexAuthAt(profile.source.dir) : null;
+      const d = profile.source.dir ? readCodexAuthAt(profile.source.dir, undefined, this.resolveEnv(profile)) : null;
       return {
         hasCredentials: !!d?.hasCredentials,
         baseUrl: !!d?.baseUrlPresent,
@@ -248,6 +273,16 @@ export class AccountService {
       };
     }
     const env = profile.source.path ? readEnvFile(profile.source.path) : {};
+    if (profile.adapter === 'claude') {
+      const d = detectClaudeEnvFile(env, cfg?.adapters.claude.configDir);
+      return {
+        hasCredentials: d.hasCredentials,
+        baseUrl: !!d.baseUrlPresent,
+        authToken: d.mode === 'authToken+BaseUrl',
+        apiKey: d.mode === 'apiKey',
+        provider: d.mode === 'providerKey',
+      };
+    }
     const provider = env.CLAUDE_CODE_USE_BEDROCK === '1' || env.CLAUDE_CODE_USE_VERTEX === '1';
     const authToken = !!env.ANTHROPIC_AUTH_TOKEN;
     const apiKey = !!(env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY);
@@ -262,6 +297,14 @@ export class AccountService {
   }
 
   sanitizeProfile(profile: AccountProfile, active: boolean, cfg?: AppConfig): SanitizedAccountProfile {
+    const profileEnv = cfg ? this.resolveEnv(profile) : undefined;
+    const cliDefaultModel = cfg
+      ? resolveCliDefaultModel(profile.adapter, cfg, profileEnv)
+      : undefined;
+    const effectiveModel = cfg
+      ? resolveEffectiveModel(profile.adapter, cfg, profileEnv)
+      : undefined;
+    const modelOverride = cfg?.adapters[profile.adapter as SwitchableAdapter]?.model?.trim() || undefined;
     return {
       id: profile.id,
       name: profile.name,
@@ -270,11 +313,16 @@ export class AccountService {
       sourceKind: profile.source.kind,
       fields: this.resolveProfileFields(profile, cfg),
       active,
+      ...(cliDefaultModel ? { cliDefaultModel } : {}),
+      ...(effectiveModel ? { effectiveModel } : {}),
+      ...(modelOverride ? { modelOverride } : {}),
     };
   }
 
   listSanitized(adapter: SwitchableAdapter, cfg: AppConfig): SanitizedAccountProfile[] {
-    const activeId = cfg.adapters[adapter].activeProfileId;
+    // Absence of an explicit choice means the native CLI profile everywhere else
+    // (selectedProfile/resolveActiveEnv). Report that same effective state to the UI.
+    const activeId = cfg.adapters[adapter].activeProfileId ?? `${adapter}:native`;
     return this.discoverProfiles(adapter, cfg).map((p) => this.sanitizeProfile(p, p.id === activeId, cfg));
   }
 
@@ -297,7 +345,7 @@ export class AccountService {
       return {
         switchableCount: switchable.length,
         nativeDefaultPresent: profiles.some((p) => p.sourceKind === 'nativeDefault'),
-        activeProfileId: cfg.adapters[adapter].activeProfileId,
+        activeProfileId: cfg.adapters[adapter].activeProfileId ?? `${adapter}:native`,
         applied: appliesAtSpawn(adapter),
         profiles,
       };
@@ -307,8 +355,10 @@ export class AccountService {
     const setupHint =
       claude.switchableCount === 0 && codex.switchableCount === 0
         ? `account switching not configured. claude: drop *.env files under ${dir}/claude/ ` +
-          `(e.g. ANTHROPIC_AUTH_TOKEN+ANTHROPIC_BASE_URL). codex: run \`CODEX_HOME=<dir> codex login\` ` +
+          `(e.g. ANTHROPIC_AUTH_TOKEN+ANTHROPIC_BASE_URL), or set CLAUDE_CONFIG_DIR to a directory ` +
+          `where the native Claude CLI already completed OAuth login. codex: run \`CODEX_HOME=<dir> codex login\` ` +
           `once per account, then drop a <name>.home file (containing the dir path) under ${dir}/codex/. ` +
+          `For a custom model_provider/base_url, append the provider's env_key as KEY=VALUE lines. ` +
           `The backend reads them 0-modify and never writes keys; keys must already be valid on the PC. ` +
           `(codex auth_credentials_store_mode must be the default File; keyring mode bypasses auth.json.)`
         : undefined;

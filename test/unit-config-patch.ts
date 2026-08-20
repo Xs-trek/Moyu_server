@@ -41,7 +41,7 @@ check('valid ptyAddon', validateConfigPatch({ ptyAddon: { enabled: false } }).le
 check('non-object patch invalid', validateConfigPatch('nope').length > 0);
 check('string approvalTimeoutSec invalid (NaN prevention)', validateConfigPatch({ approvalTimeoutSec: 'abc' }).length > 0);
 check('approvalTimeoutSec below 10 invalid', validateConfigPatch({ approvalTimeoutSec: 5 }).length > 0);
-check('approvalTimeoutSec above 590 invalid', validateConfigPatch({ approvalTimeoutSec: 600 }).length > 0);
+check('approvalTimeoutSec above 590 invalid', validateConfigPatch({ approvalTimeoutSec: 591 }).length > 0);
 check('non-integer approvalTimeoutSec invalid', validateConfigPatch({ approvalTimeoutSec: 120.5 }).length > 0);
 check('bad logLevel invalid', validateConfigPatch({ logLevel: 'verbose' }).length > 0);
 check('bad defaultAdapter invalid', validateConfigPatch({ defaultAdapter: 'foo' }).length > 0);

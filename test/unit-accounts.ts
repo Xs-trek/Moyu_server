@@ -23,11 +23,12 @@ function writeEnv(adapter: string, name: string, vars: Record<string, string>): 
   writeFileSync(join(dir, `${name}.env`), body + '\n');
 }
 
-/** Write a codex <name>.home file whose content is a CODEX_HOME dir path (path 1). */
-function writeHome(name: string, homeDir: string): void {
+/** Write a Codex profile: legacy first-line CODEX_HOME plus optional custom-provider env. */
+function writeHome(name: string, homeDir: string, vars: Record<string, string> = {}): void {
   const dir = join(profilesDir, 'codex');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, `${name}.home`), homeDir + '\n');
+  const body = [homeDir, ...Object.entries(vars).map(([key, value]) => `${key}=${value}`)].join('\n');
+  writeFileSync(join(dir, `${name}.home`), body + '\n');
 }
 
 const checks: [string, boolean][] = [];
@@ -49,22 +50,44 @@ async function main(): Promise<void> {
   writeEnv('claude', 'anthropic-key', { ANTHROPIC_API_KEY: 'sk-ant-test-KEYVALUE', ANTHROPIC_BASE_URL: 'http://127.0.0.1:1' });
   writeEnv('claude', 'anthropic-token', { ANTHROPIC_AUTH_TOKEN: 'sk-test-TOKENVALUE', ANTHROPIC_BASE_URL: 'http://127.0.0.1:1' });
   writeEnv('claude', 'bedrock', { CLAUDE_CODE_USE_BEDROCK: '1', AWS_REGION: 'us-east-1' });
+  const claudeOauthDir = join(TMP, 'claude-oauth-acctB');
+  mkdirSync(claudeOauthDir, { recursive: true });
+  writeFileSync(join(claudeOauthDir, '.credentials.json'), JSON.stringify({
+    claudeAiOauth: { accessToken: 'oauth-secret-never-echo' },
+  }));
+  writeFileSync(join(claudeOauthDir, 'settings.json'), JSON.stringify({
+    model: 'opus',
+    env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-profile-local' },
+  }));
+  writeEnv('claude', 'oauth-directory', { CLAUDE_CONFIG_DIR: claudeOauthDir });
   claudeProfiles = acc.discoverProfiles('claude');
   const byId = new Map(claudeProfiles.map((p) => [p.id, p]));
-  check('discovery: env profiles discovered (3 + native)', claudeProfiles.length === 4);
+  check('discovery: env profiles discovered (4 + native)', claudeProfiles.length === 5);
   check('authMode apiKey inferred', byId.get('claude:env:anthropic-key')?.authMode === 'apiKey');
   check('authMode authToken+BaseUrl inferred', byId.get('claude:env:anthropic-token')?.authMode === 'authToken+BaseUrl');
   check('authMode providerKey inferred', byId.get('claude:env:bedrock')?.authMode === 'providerKey');
+  check('authMode OAuth inferred from CLAUDE_CONFIG_DIR', byId.get('claude:env:oauth-directory')?.authMode === 'oauth');
 
   // 3. Sanitize: field PRESENCE only; key VALUES never echoed.
   const cfg0 = loadConfig();
   const sanitized = acc.listSanitized('claude', cfg0);
   const blob = JSON.stringify(sanitized);
+  check('sanitize: native profile is the effective active default', sanitized.find((p) => p.id === 'claude:native')?.active === true);
   check('sanitize: no key value echoed (KEYVALUE)', !blob.includes('KEYVALUE'));
   check('sanitize: no key value echoed (TOKENVALUE)', !blob.includes('TOKENVALUE'));
   check('sanitize: fields.hasCredentials true for apiKey profile', sanitized.find((p) => p.id === 'claude:env:anthropic-key')?.fields.apiKey === true);
   check('sanitize: fields.baseUrl true for apiKey profile', sanitized.find((p) => p.id === 'claude:env:anthropic-key')?.fields.baseUrl === true);
   check('sanitize: fields.provider true for bedrock profile', sanitized.find((p) => p.id === 'claude:env:bedrock')?.fields.provider === true);
+  check('sanitize: OAuth directory reports credentials', sanitized.find((p) => p.id === 'claude:env:oauth-directory')?.fields.hasCredentials === true);
+  check('sanitize: OAuth directory secret is not echoed', !blob.includes('oauth-secret'));
+  const oauthSanitized = sanitized.find((p) => p.id === 'claude:env:oauth-directory');
+  check('sanitize: profile exposes locally resolved CLI default model', oauthSanitized?.cliDefaultModel === 'glm-profile-local');
+  check('sanitize: effective model inherits the profile CLI default without an override', oauthSanitized?.effectiveModel === 'glm-profile-local');
+  cfg0.adapters.claude.model = 'forced-local-override';
+  const overriddenOauth = acc.listSanitized('claude', cfg0).find((p) => p.id === 'claude:env:oauth-directory');
+  check('sanitize: explicit adapter model is distinguishable from the profile CLI default',
+    overriddenOauth?.cliDefaultModel === 'glm-profile-local' && overriddenOauth?.effectiveModel === 'forced-local-override');
+  cfg0.adapters.claude.model = undefined;
 
   // 4. resolveEnv: nativeDefault -> {}; envFile -> values present.
   check('resolveEnv nativeDefault is empty', Object.keys(acc.resolveEnv(byId.get('claude:native')!)).length === 0);
@@ -89,6 +112,8 @@ async function main(): Promise<void> {
   rmSync(join(profilesDir, 'claude'), { recursive: true, force: true });
   const statusEmpty = acc.getAccountSwitchingStatus(cfg0);
   check('status: empty -> setupHint present', typeof statusEmpty.setupHint === 'string');
+  check('status: setupHint explains Claude OAuth directory profiles', statusEmpty.setupHint?.includes('CLAUDE_CONFIG_DIR') === true);
+  check('status: omitted selection reports native effective profile', statusEmpty.adapters.claude.activeProfileId === 'claude:native');
   check('status: claude applied=true', statusEmpty.adapters.claude.applied === true);
   check('status: codex applied=true (no longer reserved)', statusEmpty.adapters.codex.applied === true);
   check('status: profilesDir echoed', statusEmpty.profilesDir === profilesDir);
@@ -110,28 +135,49 @@ async function main(): Promise<void> {
       last_refresh: '2026-07-31T00:00:00Z',
     }),
   );
+  writeFileSync(join(codexHomeB, 'config.toml'), 'model = "gpt-profile-local"\n');
   writeHome('acctB', codexHomeB);
+  const codexVolcHome = join(TMP, 'codex-home-volcengine');
+  mkdirSync(codexVolcHome, { recursive: true });
+  writeFileSync(join(codexVolcHome, 'config.toml'), [
+    'model = "doubao-seed-code"',
+    'model_provider = "volcengine"',
+    '[model_providers.volcengine]',
+    'base_url = "https://ark.example.invalid/api/v3"',
+    'env_key = "ARK_API_KEY"',
+    'wire_api = "responses"',
+  ].join('\n') + '\n');
+  writeHome('volcengine', codexVolcHome, { ARK_API_KEY: 'ark-secret-never-echo' });
   const codexProfiles = acc.discoverProfiles('codex');
   const codexBy = new Map(codexProfiles.map((p) => [p.id, p]));
-  check('codexHome: nativeDefault + acctB discovered', codexProfiles.length === 2);
+  check('codexHome: OAuth and custom URL profiles discovered with native default', codexProfiles.length === 3);
   check('codexHome: acctB sourceKind codexHome', codexBy.get('codex:home:acctB')?.source.kind === 'codexHome');
   check('codexHome: acctB authMode oauth inferred', codexBy.get('codex:home:acctB')?.authMode === 'oauth');
   check('codexHome: acctB dir captured', codexBy.get('codex:home:acctB')?.source.dir === codexHomeB);
   const codexEnv = acc.resolveEnv(codexBy.get('codex:home:acctB')!);
   check('codexHome: resolveEnv returns CODEX_HOME', codexEnv.CODEX_HOME === codexHomeB);
   check('codexHome: resolveEnv has no token values', !JSON.stringify(codexEnv).includes('TOKENVALUE'));
+  const volcProfile = codexBy.get('codex:home:volcengine')!;
+  const volcEnv = acc.resolveEnv(volcProfile);
+  check('codexHome: custom provider env_key is applied per profile',
+    volcEnv.CODEX_HOME === codexVolcHome && volcEnv.ARK_API_KEY === 'ark-secret-never-echo');
+  check('codexHome: custom provider env_key is inferred as API-key auth', volcProfile.authMode === 'apiKey');
   const codexSan = acc.listSanitized('codex', cfg0);
   const codexBlob = JSON.stringify(codexSan);
   check('codexHome: sanitize no access/refresh token echoed', !codexBlob.includes('TOKENVALUE'));
   check('codexHome: sanitize no id token echoed', !codexBlob.includes('IDTOKEN'));
+  check('codexHome: sanitize no custom provider key echoed', !codexBlob.includes('ark-secret'));
   check('codexHome: fields.hasCredentials true', codexSan.find((p) => p.id === 'codex:home:acctB')?.fields.hasCredentials === true);
+  check('codexHome: local config model is projected without provider discovery',
+    codexSan.find((p) => p.id === 'codex:home:acctB')?.cliDefaultModel === 'gpt-profile-local' &&
+    codexSan.find((p) => p.id === 'codex:home:acctB')?.effectiveModel === 'gpt-profile-local');
   acc.activate('codex', 'codex:home:acctB', cfg0);
   check('codexHome: activate sets activeProfileId', cfg0.adapters.codex.activeProfileId === 'codex:home:acctB');
   const codexActiveEnv = acc.resolveActiveEnv('codex', cfg0);
   check('codexHome: resolveActiveEnv returns CODEX_HOME after activate', codexActiveEnv.CODEX_HOME === codexHomeB);
   const codexStatus = acc.getAccountSwitchingStatus(cfg0);
   check('codexHome: codex applied=true (no longer reserved)', codexStatus.adapters.codex.applied === true);
-  check('codexHome: codex switchableCount=1', codexStatus.adapters.codex.switchableCount === 1);
+  check('codexHome: codex switchableCount=2', codexStatus.adapters.codex.switchableCount === 2);
   cfg0.adapters.codex.activeProfileId = undefined;
 
   // 9. (audit, C3) AccountService exposes NO probe method -- the tool makes no provider call.

@@ -12,6 +12,7 @@ import {
   attachWs,
   send as wsSend,
   AckTracker,
+  isApprovalDecision,
   NetNotifier,
   MAX_BUFFERED_BYTES,
   CLOSE_BACKPRESSURE,
@@ -38,6 +39,13 @@ function check(name: string, cond: boolean): void {
     console.error(`  ✗ FAIL: ${name}`);
   }
 }
+
+check('approval boundary accepts bounded AskUserQuestion answers', isApprovalDecision({
+  allowWithModification: { answers: { 'Choose one': 'A', 'Choose many': ['A', 'B'] } },
+}));
+check('approval boundary rejects arbitrary tool-input replacement', !isApprovalDecision({
+  allowWithModification: { command: 'unexpected' },
+}));
 
 // ---------- mock adapter with per-session emit handle ----------
 class MockHandle implements SessionHandle {
@@ -82,7 +90,7 @@ const adapter: Adapter = {
     interrupt: true,
     accountProfiles: false,
     approval: { transport: 'native', semantics: 'native', policies: [] },
-    configuration: { model: false, effortLevels: [], sandboxModes: [], reviewers: [] },
+    configuration: { model: false, modelSelection: 'freeform' as const, effortLevels: [], permissionModes: [], sandboxModes: [], reviewers: [] },
   },
   async isAvailable() {
     return true;
@@ -240,7 +248,9 @@ async function partD(): Promise<void> {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   function openWs(): Promise<{ ws: WebSocket; events: any[] }> {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws?token=t`);
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ws`, {
+        headers: { Authorization: 'Bearer t' },
+      });
       const events: any[] = [];
       ws.on('message', (raw) => {
         try {

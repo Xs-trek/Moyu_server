@@ -15,7 +15,7 @@
 // never crashes the gateway). T5: LGPL binary via spawn only (no linking).
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { log, registerSecrets, safeStderrSummary } from '../util/logger';
 import { isWindows } from '../util/platform';
@@ -315,6 +315,9 @@ export class EasyTierController {
 
     try {
       const child = spawn(this.bin, args, {
+        // Keep product/install launch paths out of the long-lived network helper's cwd. The
+        // executable path is resolved before spawn; EasyTier receives only absolute/config data.
+        cwd: homedir(),
         windowsHide: true,
         env: { ...process.env, NO_COLOR: '1' },
       });
@@ -426,7 +429,7 @@ function resolveBin(explicit?: string): string | null {
   // §3: compiled single-binary mode. The embedded easytier-core was materialized
   // to a temp dir at startup; use it (no external bin/ dir or PATH needed).
   const embedded = getEmbeddedBinPath();
-  if (embedded) return embedded;
+  if (embedded) return resolve(embedded);
   const exe = isWindows ? 'easytier-core.exe' : 'easytier-core';
   const candidates: string[] = [];
   if (explicit) candidates.push(explicit);
@@ -435,9 +438,10 @@ function resolveBin(explicit?: string): string | null {
   candidates.push(join(process.cwd(), 'bin', isWindows ? 'win-x64' : process.platform, exe));
   candidates.push(join(homedir(), '.remote-dashboard', 'bin', exe));
   for (const c of candidates) {
-    if (c && existsSync(c)) return c;
+    if (c && existsSync(c)) return resolve(c);
   }
-  return which(exe);
+  const fromPath = which(exe);
+  return fromPath ? resolve(fromPath) : null;
 }
 
 /** Robust process-tree kill (Windows taskkill /T /F, unix SIGTERM->SIGKILL). */

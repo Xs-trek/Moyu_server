@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { detectClaudeAuth, resolveClaudeConfigLocation } from '../src/adapters/claude/auth';
 import { detectCodexAuth, resolveCodexConfigLocation } from '../src/adapters/codex/auth';
 import { mergeConfigDirectoryEnv } from '../src/adapters/config-location';
+import { buildClaudeSpawnEnv } from '../src/adapters/claude/session';
 import { AccountService } from '../src/accounts/service';
 import { loadConfig } from '../src/config/loader';
 
@@ -17,8 +18,10 @@ function check(name: string, condition: boolean): void {
 
 const root = join(tmpdir(), `moyu-auth-locations-${process.pid}-${Date.now()}`);
 const claudeDir = join(root, 'Claude Config With Spaces');
+const claudeOauthDir = join(root, 'claude-oauth-profile');
 const codexDir = join(root, 'codex-home');
 mkdirSync(claudeDir, { recursive: true });
+mkdirSync(claudeOauthDir, { recursive: true });
 mkdirSync(codexDir, { recursive: true });
 
 const savedEnv = {
@@ -44,6 +47,60 @@ try {
   check('Claude detects settings.json.env auth token', claude.mode === 'authToken+BaseUrl');
   check('Claude detects settings.json.env base URL presence', claude.baseUrlPresent === true);
   check('Claude auth result contains no credential value', !JSON.stringify(claude).includes('unit-secret'));
+
+  writeFileSync(join(claudeOauthDir, '.credentials.json'), JSON.stringify({
+    claudeAiOauth: { accessToken: 'unit-oauth-secret-never-echo' },
+  }));
+  const claudeOauth = detectClaudeAuth(claudeOauthDir, { CLAUDE_CONFIG_DIR: claudeOauthDir });
+  check('Claude detects OAuth in profile CLAUDE_CONFIG_DIR', claudeOauth.mode === 'oauth');
+  check('Claude OAuth profile result contains no credential value', !JSON.stringify(claudeOauth).includes('unit-oauth-secret'));
+  const claudeTokenOauth = detectClaudeAuth(codexDir, {
+    CLAUDE_CONFIG_DIR: codexDir,
+    CLAUDE_CODE_OAUTH_TOKEN: 'selected-oauth-token-never-echo',
+  });
+  check('Claude detects setup-token OAuth profiles', claudeTokenOauth.mode === 'oauth');
+  check('Claude setup-token result contains no credential value', !JSON.stringify(claudeTokenOauth).includes('selected-oauth-token'));
+
+  const inheritedClaudeEnv: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    ANTHROPIC_API_KEY: 'native-key-must-not-leak',
+    ANTHROPIC_AUTH_TOKEN: 'native-token-must-not-leak',
+    ANTHROPIC_BASE_URL: 'https://native-relay.invalid',
+    CLAUDE_CODE_OAUTH_TOKEN: 'native-oauth-must-not-leak',
+    CLAUDE_CODE_USE_BEDROCK: '1',
+    CLAUDE_CODE_USE_VERTEX: '1',
+    AWS_REGION: 'us-east-1',
+  };
+  const oauthSpawn = buildClaudeSpawnEnv(
+    { CLAUDE_CONFIG_DIR: claudeOauthDir },
+    true,
+    inheritedClaudeEnv,
+  );
+  check('Claude OAuth profile clears inherited API key', oauthSpawn.ANTHROPIC_API_KEY === undefined);
+  check('Claude OAuth profile clears inherited auth token', oauthSpawn.ANTHROPIC_AUTH_TOKEN === undefined);
+  check('Claude OAuth profile clears inherited base URL', oauthSpawn.ANTHROPIC_BASE_URL === undefined);
+  check('Claude OAuth profile clears inherited setup-token OAuth', oauthSpawn.CLAUDE_CODE_OAUTH_TOKEN === undefined);
+  check('Claude OAuth profile clears inherited provider selectors',
+    oauthSpawn.CLAUDE_CODE_USE_BEDROCK === undefined && oauthSpawn.CLAUDE_CODE_USE_VERTEX === undefined);
+  check('Claude OAuth profile preserves non-conflicting provider environment', oauthSpawn.AWS_REGION === 'us-east-1');
+  check('Claude OAuth profile selects its configuration directory', oauthSpawn.CLAUDE_CONFIG_DIR === claudeOauthDir);
+
+  const directProfileSpawn = buildClaudeSpawnEnv({
+    ANTHROPIC_API_KEY: 'selected-key',
+    ANTHROPIC_BASE_URL: 'https://selected-relay.invalid',
+  }, true, inheritedClaudeEnv);
+  check('Claude direct profile values win after isolation',
+    directProfileSpawn.ANTHROPIC_API_KEY === 'selected-key' &&
+    directProfileSpawn.ANTHROPIC_BASE_URL === 'https://selected-relay.invalid');
+  check('Claude direct profile does not retain native token/provider mode',
+    directProfileSpawn.ANTHROPIC_AUTH_TOKEN === undefined &&
+    directProfileSpawn.CLAUDE_CODE_USE_BEDROCK === undefined);
+
+  const nativeSpawn = buildClaudeSpawnEnv(undefined, false, inheritedClaudeEnv);
+  check('Claude native profile preserves native CLI auth environment',
+    nativeSpawn.ANTHROPIC_API_KEY === inheritedClaudeEnv.ANTHROPIC_API_KEY &&
+    nativeSpawn.ANTHROPIC_BASE_URL === inheritedClaudeEnv.ANTHROPIC_BASE_URL &&
+    nativeSpawn.CLAUDE_CODE_OAUTH_TOKEN === inheritedClaudeEnv.CLAUDE_CODE_OAUTH_TOKEN);
 
   writeFileSync(join(codexDir, 'auth.json'), JSON.stringify({
     auth_mode: 'Chatgpt',

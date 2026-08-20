@@ -1,6 +1,7 @@
 // SessionManager: session lifecycle, incremental history (by seq, I2), and event
 // fan-out to WS subscribers (I10). Each session binds one adapter SessionHandle.
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import type {
   AdapterEvent,
@@ -11,9 +12,12 @@ import type {
   TransportMetrics,
   UserInput,
   ReasoningEffort,
+  PermissionMode,
+  ArtifactRef,
 } from '../adapters/types';
 import type { AdapterManager } from '../adapters/manager';
 import { log } from '../util/logger';
+import type { ArtifactStore } from '../artifacts/store';
 
 export interface WsEventEnvelope {
   type: 'event';
@@ -65,9 +69,15 @@ interface SessionRecord {
   cwd: string;
   profileId?: string;
   model?: string;
+  requestedModel?: string;
+  runtimeModel?: string;
   effort?: ReasoningEffort;
+  permissionMode?: PermissionMode;
   updatedAt: string;
   turnState: 'idle' | 'running' | 'completed' | 'failed';
+  /** Local wall-clock observation from accepted user input through terminal completion. It is
+   * never exposed except as the bounded elapsed duration added to turn.completed. */
+  turnStartedAtMs?: number;
   transport: TransportMetrics;
   pendingInputAt: Array<{ acceptedAt: number }>;
   eventDroppedThroughSeq: number;
@@ -86,7 +96,10 @@ export interface SessionSummary {
   cliSessionRef?: string;
   profileId?: string;
   model?: string;
+  requestedModel?: string;
+  runtimeModel?: string;
   effort?: ReasoningEffort;
+  permissionMode?: PermissionMode;
   turnState: 'idle' | 'running' | 'completed' | 'failed';
   transport: TransportMetrics;
 }
@@ -100,7 +113,13 @@ export interface CreateSessionOpts {
   profileEnv?: Record<string, string>;
   profileId?: string;
   model?: string;
+  /** Effective native model for display only. Unlike `model`, this value is never forwarded to
+   * the adapter as a CLI override. Runtime turn metadata may replace it later. */
+  displayModel?: string;
   effort?: ReasoningEffort;
+  permissionMode?: PermissionMode;
+  /** Read-only native history normalized before resuming an existing CLI session. */
+  seedMessages?: Message[];
 }
 
 export interface SessionSyncSnapshot {
@@ -118,6 +137,19 @@ export interface SessionSyncSnapshot {
   nextMessageAfterSeq: number;
   messagesTruncatedBeforeSeq: number;
   generatedAt: string;
+}
+
+/**
+ * Choose the native CLI working directory without inheriting the daemon launch directory.
+ *
+ * The gateway may have been started from its install/source tree. Passing an undefined `cwd`
+ * to child_process.spawn would expose that product-owned path to the native CLI, its tools and
+ * potentially the transcript. A normal headless invocation still needs a deterministic working
+ * directory, so an omitted/empty client value uses the user's home directory. Explicit user
+ * choices (including native-history resume cwd) remain unchanged apart from normalization.
+ */
+export function resolveSessionWorkingDirectory(cwd?: string): string {
+  return resolve(cwd === undefined || cwd === '' ? homedir() : cwd);
 }
 
 function serializedChars(value: unknown): number {
@@ -167,28 +199,41 @@ function boundAdapterEvent(event: AdapterEvent): AdapterEvent {
 export class SessionManager {
   private sessions = new Map<string, SessionRecord>();
 
-  constructor(private adapters: AdapterManager) {}
+  constructor(
+    private adapters: AdapterManager,
+    private artifacts?: ArtifactStore,
+    private readonly nowMs: () => number = Date.now,
+  ) {}
 
   async create(kind: AdapterKind, opts: CreateSessionOpts = {}): Promise<string> {
     if (this.sessions.size >= MAX_ACTIVE_SESSIONS) throw new Error('active session limit reached');
     const effortLevels = this.adapters.get(kind)?.capabilities.configuration.effortLevels ?? [];
     if (opts.effort && !effortLevels.includes(opts.effort)) throw new Error(`unsupported effort for ${kind}`);
+    const permissionModes = this.adapters.get(kind)?.capabilities.configuration.permissionModes ?? [];
+    if (opts.permissionMode && !permissionModes.includes(opts.permissionMode)) throw new Error(`unsupported permission mode for ${kind}`);
     const sessionId = randomUUID();
+    const cwd = resolveSessionWorkingDirectory(opts.cwd);
     const handle = await this.adapters.startSession(kind, {
       sessionId,
       cliSessionRef: opts.cliSessionRef ?? sessionId,
-      cwd: opts.cwd,
+      cwd,
       extraDirs: opts.extraDirs,
       profileEnv: opts.profileEnv,
       model: opts.model,
       effort: opts.effort,
+      permissionMode: opts.permissionMode,
     });
+    const seededMessages = (opts.seedMessages ?? []).map((message, index) => ({
+      ...message,
+      seq: index + 1,
+      createdAt: message.createdAt || new Date().toISOString(),
+    }));
     const record: SessionRecord = {
       sessionId,
       kind,
       handle,
-      messages: [],
-      seq: 0,
+      messages: seededMessages,
+      seq: seededMessages.at(-1)?.seq ?? 0,
       createdAt: new Date().toISOString(),
       title: opts.title,
       subscribers: new Set(),
@@ -197,10 +242,12 @@ export class SessionManager {
       eventRingChars: 0,
       pendingApprovals: new Map(),
       lastTerminalTurn: null,
-      cwd: resolve(opts.cwd ?? process.cwd()),
+      cwd,
       profileId: opts.profileId,
-      model: handle.model ?? opts.model,
+      model: opts.displayModel ?? handle.model ?? opts.model,
+      requestedModel: handle.model ?? opts.model,
       effort: handle.effort ?? opts.effort,
+      permissionMode: handle.permissionMode ?? opts.permissionMode,
       updatedAt: new Date().toISOString(),
       turnState: 'idle',
       transport: { observedAt: new Date().toISOString() },
@@ -208,6 +255,7 @@ export class SessionManager {
       eventDroppedThroughSeq: 0,
       messageDroppedThroughSeq: 0,
     };
+    this.enforceMessageBounds(record);
     record.unsub = handle.onEvent((ev) => this.onAdapterEvent(record, ev));
     this.sessions.set(sessionId, record);
     log.info('session created', { sessionId, kind });
@@ -215,12 +263,29 @@ export class SessionManager {
   }
 
   private onAdapterEvent(r: SessionRecord, ev: AdapterEvent): void {
+    if (ev.type === 'tool.output' && ev.base64) {
+      try {
+        if (!this.artifacts || !ev.mime) throw new Error('artifact store or mime unavailable');
+        const stored = this.artifacts.putBase64(ev.base64, ev.mime, ev.name);
+        ev = { type: 'tool.output', toolCallId: ev.toolCallId, text: ev.text, artifact: stored.ref };
+      } catch (error) {
+        log.warn('tool image omitted', { sessionId: r.sessionId, err: String(error) });
+        ev = {
+          type: 'tool.output',
+          toolCallId: ev.toolCallId,
+          text: (ev.text ?? '') + (ev.text ? '\n' : '') + '[image output unavailable]',
+        };
+      }
+    }
     ev = boundAdapterEvent(ev);
-    const now = Date.now();
+    const now = this.nowMs();
     r.updatedAt = new Date(now).toISOString();
     if (ev.type === 'turn.started') {
       r.turnState = 'running';
       const pending = r.pendingInputAt.shift();
+      // The accepted timestamp also covers adapter queueing and pre-spawn safety checks. This
+      // makes the reported duration match what the remote user actually waited for.
+      r.turnStartedAtMs = pending?.acceptedAt ?? now;
       this.publish(r, ev);
       if (pending) {
         this.publish(r, {
@@ -231,9 +296,28 @@ export class SessionManager {
       return;
     } else if (ev.type === 'turn.completed') {
       r.turnState = 'completed';
+      if (ev.model?.trim()) {
+        r.runtimeModel = ev.model.trim();
+        if (!r.requestedModel) r.model = r.runtimeModel;
+      }
+      // Compatibility adapters may only expose a terminal event. Fall back to the accepted
+      // input timestamp rather than dropping timing or leaving the queue misaligned.
+      const observedStart = r.turnStartedAtMs ?? r.pendingInputAt.shift()?.acceptedAt;
+      if (observedStart !== undefined) {
+        ev = {
+          ...ev,
+          performance: { observedDurationMs: Math.max(0, Math.round(now - observedStart)) },
+        };
+      }
+      r.turnStartedAtMs = undefined;
     } else if (ev.type === 'turn.failed') {
       r.turnState = 'failed';
+      // A pre-start guard/spawn failure still consumes exactly one accepted input. Removing it
+      // here prevents the next healthy turn from inheriting the failed turn's start time.
+      if (r.turnStartedAtMs === undefined) r.pendingInputAt.shift();
+      r.turnStartedAtMs = undefined;
     }
+    r.permissionMode = r.handle.permissionMode ?? r.permissionMode;
     this.publish(r, ev);
   }
 
@@ -321,25 +405,19 @@ export class SessionManager {
           // Without this the mutation keeps the old seq and the streamed output is invisible
           // to incremental history backfill after a reconnect.
           last.seq = r.seq;
+          if (ev.artifact) {
+            const artifacts: ArtifactRef[] = last.artifacts ?? [];
+            if (!artifacts.some((artifact) => artifact.artifactId === ev.artifact!.artifactId)) artifacts.push(ev.artifact);
+            last.artifacts = artifacts;
+          }
           this.enforceMessageBounds(r);
         } else {
           const truncated =
             chunk.length > MAX_TOOL_OUTPUT_CHARS ? chunk.slice(0, MAX_TOOL_OUTPUT_CHARS) + '…[truncated]' : chunk;
-          this.msg(r, { role: 'tool', toolCallId: ev.toolCallId, toolOutput: truncated });
+          this.msg(r, { role: 'tool', toolCallId: ev.toolCallId, toolOutput: truncated, artifacts: ev.artifact ? [ev.artifact] : undefined });
         }
         break;
       }
-      case 'approval.request':
-        this.msg(r, {
-          role: 'system',
-          text: `[approval:${ev.kind}] ${ev.summary}`,
-          tool: ev.tool,
-          toolInput: ev.input,
-        });
-        break;
-      case 'turn.failed':
-        this.msg(r, { role: 'system', text: `[error:${ev.category}] ${ev.summary}` });
-        break;
       default:
         break;
     }
@@ -358,7 +436,10 @@ export class SessionManager {
       cliSessionRef: r.handle.cliSessionRef,
       profileId: r.profileId,
       model: r.model,
+      requestedModel: r.requestedModel,
+      runtimeModel: r.runtimeModel,
       effort: r.effort,
+      permissionMode: r.permissionMode,
       turnState: r.turnState,
       transport: { ...r.transport },
     })).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -387,6 +468,32 @@ export class SessionManager {
     if (!r.handle.setEffort) throw new Error(`effort is not configurable for ${r.kind}`);
     await r.handle.setEffort(effort);
     r.effort = effort;
+    r.updatedAt = new Date().toISOString();
+    return this.summary(sessionId)!;
+  }
+
+  async setModel(sessionId: string, model?: string): Promise<SessionSummary> {
+    const r = this.sessions.get(sessionId);
+    if (!r) throw new Error('session not found');
+    if (r.turnState === 'running') throw new Error('cannot change model while a turn is running');
+    if (!r.handle.setModel) throw new Error(`model is not configurable for ${r.kind}`);
+    const normalized = model?.trim();
+    if (normalized && normalized.length > 128) throw new Error('invalid model');
+    await r.handle.setModel(normalized || undefined);
+    r.requestedModel = normalized || undefined;
+    r.model = r.requestedModel ?? r.runtimeModel;
+    r.updatedAt = new Date().toISOString();
+    return this.summary(sessionId)!;
+  }
+
+  async setPermissionMode(sessionId: string, mode: PermissionMode): Promise<SessionSummary> {
+    const r = this.sessions.get(sessionId);
+    if (!r) throw new Error('session not found');
+    if (r.turnState === 'running') throw new Error('cannot change permission mode while a turn is running');
+    const supported = this.adapters.get(r.kind)?.capabilities.configuration.permissionModes ?? [];
+    if (!supported.includes(mode) || !r.handle.setPermissionMode) throw new Error(`unsupported permission mode for ${r.kind}`);
+    await r.handle.setPermissionMode(mode);
+    r.permissionMode = mode;
     r.updatedAt = new Date().toISOString();
     return this.summary(sessionId)!;
   }
@@ -500,18 +607,23 @@ export class SessionManager {
     return replay;
   }
 
-  async send(sessionId: string, input: UserInput): Promise<void> {
+  async send(sessionId: string, input: UserInput): Promise<number> {
     const r = this.sessions.get(sessionId);
     if (!r) throw new Error('session not found');
-    const pending = { acceptedAt: Date.now() };
+    const pending = { acceptedAt: this.nowMs() };
     const previousDroppedThroughSeq = r.messageDroppedThroughSeq;
     r.pendingInputAt.push(pending);
     r.seq += 1;
     const inputSeq = r.seq;
-    const dropped = this.msg(r, { role: 'user', text: input.text });
+    const dropped = this.msg(r, {
+      role: 'user',
+      text: input.text,
+      artifacts: input.attachments?.map(({ path: _path, ...artifact }) => artifact),
+    });
     try {
       await r.handle.send(input);
       r.updatedAt = new Date().toISOString();
+      return inputSeq;
     } catch (error) {
       const pendingIndex = r.pendingInputAt.indexOf(pending);
       if (pendingIndex >= 0) r.pendingInputAt.splice(pendingIndex, 1);

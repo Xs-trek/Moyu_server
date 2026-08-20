@@ -1,14 +1,16 @@
 // Config loader: local JSON (mode 0600), env override, first-run generation of
 // token / networkSecret / networkName. Never logs secret values (logger redacts).
-import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { homedir, platform } from 'node:os';
+import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import type { AppConfig, ConfigPatch } from './schema';
 import { DEFAULT_ADAPTER_CONFIG } from './schema';
 import { log } from '../util/logger';
+import { ensurePrivateDirectory, securePrivateFile, writeFileInPrivateDirectory, writePrivateFile } from '../util/private-file';
 
 const DEFAULT_CONFIG_PATH = join(homedir(), '.remote-dashboard', 'config.json');
+const DEFAULT_CONFIG_DIR = dirname(DEFAULT_CONFIG_PATH);
 
 /**
  * Active config file path. Set by loadConfig() so the server (and /config PATCH)
@@ -16,6 +18,23 @@ const DEFAULT_CONFIG_PATH = join(homedir(), '.remote-dashboard', 'config.json');
  * > REMOTE_DASHBOARD_CONFIG env > ~/.remote-dashboard/config.json.
  */
 let activePath: string | null = null;
+/** Paths already verified private by this process. Re-checking the same app-owned config on
+ * every PATCH needlessly launches Windows PowerShell and can fail transiently after startup
+ * even though the protected DACL has not changed. Never cache custom paths: another actor may
+ * replace those between writes, so they remain fail-closed on every operation. */
+const verifiedDefaultPrivatePaths = new Set<string>();
+
+function isDefaultPrivatePath(path: string): boolean {
+  return resolve(dirname(path)) === resolve(DEFAULT_CONFIG_DIR);
+}
+
+function secureDefaultConfigOnce(path: string): void {
+  const resolvedPath = resolve(path);
+  if (verifiedDefaultPrivatePaths.has(resolvedPath)) return;
+  ensurePrivateDirectory(dirname(resolvedPath));
+  if (existsSync(resolvedPath)) securePrivateFile(resolvedPath);
+  verifiedDefaultPrivatePaths.add(resolvedPath);
+}
 
 function resolveConfigPath(explicit?: string): string {
   if (explicit) return resolve(explicit);
@@ -59,6 +78,10 @@ export function loadConfig(path?: string, opts: { generate?: boolean } = {}): Ap
   activePath = cfgPath;
   let loaded: unknown = {};
   if (existsSync(cfgPath)) {
+    // Harden before reading: on Windows a prior `{mode:0o600}` file may still carry a broad
+    // inherited DACL. Failure is fatal so the gateway never starts with exposed credentials.
+    if (isDefaultPrivatePath(cfgPath)) secureDefaultConfigOnce(cfgPath);
+    else securePrivateFile(cfgPath);
     try {
       loaded = JSON.parse(readFileSync(cfgPath, 'utf8'));
     } catch (e) {
@@ -111,8 +134,9 @@ export function loadConfig(path?: string, opts: { generate?: boolean } = {}): Ap
       cfg.network.networkName = 'rd-' + randomBytes(4).toString('hex');
       dirty = true;
     }
-    // approval timeout must stay under claude hook hard limit (600s).
-    if (cfg.approvalTimeoutSec >= 600) {
+    // Preserve the established public configuration bound. The command relay owns its own
+    // timeout and Claude's command-hook timeout is only a later backstop.
+    if (cfg.approvalTimeoutSec > 590) {
       cfg.approvalTimeoutSec = 590;
       dirty = true;
     }
@@ -123,14 +147,16 @@ export function loadConfig(path?: string, opts: { generate?: boolean } = {}): Ap
 
 export function saveConfig(cfg: AppConfig): void {
   const cfgPath = activePath ?? resolveConfigPath();
-  mkdirSync(dirname(cfgPath), { recursive: true });
-  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), { mode: 0o600 });
-  if (platform() !== 'win32') {
-    try {
-      chmodSync(cfgPath, 0o600);
-    } catch {
-      // best-effort
-    }
+  // The default app-owned config directory is private. For an explicit config inside an
+  // existing operator-owned directory, writePrivateFile secures the file without rewriting
+  // unrelated parent-directory ACLs; a missing custom parent is created privately.
+  if (isDefaultPrivatePath(cfgPath)) {
+    secureDefaultConfigOnce(cfgPath);
+    writeFileInPrivateDirectory(cfgPath, JSON.stringify(cfg, null, 2));
+  } else {
+    // An operator-owned custom parent has not gone through our one-time app-root proof. Preserve
+    // the original fail-closed behavior and re-harden the exact file before every overwrite.
+    writePrivateFile(cfgPath, JSON.stringify(cfg, null, 2));
   }
   log.info('config persisted', { path: cfgPath });
 }

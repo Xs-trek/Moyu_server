@@ -1,9 +1,9 @@
 {
   "name": "remote-dashboard",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "type": "module",
-  "description": "Remote AI CLI control backend (claude/codex/opencode over EasyTier overlay)",
+  "description": "Remote AI CLI control backend (Claude/Codex over EasyTier overlay)",
   "license": "Apache-2.0",
   "engines": { "node": ">=22" },
   "scripts": {
@@ -19,7 +19,7 @@
     "build:macos-x64": "bun scripts/build.mjs --target macos-x64",
     "build:macos-arm64": "bun scripts/build.mjs --target macos-arm64",
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/unit-config.ts && tsx test/unit-config-patch.ts && tsx test/unit-accounts.ts && tsx test/unit-auth-locations.ts && tsx test/unit-cli.ts && tsx test/unit-codex-adapter.ts && tsx test/unit-verdict.ts && tsx test/unit-hooks.ts && tsx test/unit-hook-relay.ts && tsx test/unit-logger.ts && tsx test/unit-bridge.ts && tsx test/unit-net.ts && tsx test/unit-adapter.ts && tsx test/unit-manager.ts && tsx test/unit-ws-replay.ts && tsx test/unit-diff.ts && tsx test/unit-net-notify.ts && tsx test/unit-embedded-bin.ts && tsx test/unit-egress.ts && tsx test/integration-gateway.ts"
+    "test": "tsx test/unit-private-file.ts && tsx test/unit-hook-command.ts && tsx test/unit-config.ts && tsx test/unit-config-default-cache.ts && tsx test/unit-config-patch.ts && tsx test/unit-accounts.ts && tsx test/unit-auth-locations.ts && tsx test/unit-gateway-auth.ts && tsx test/unit-native-history.ts && tsx test/unit-cli.ts && tsx test/unit-codex-adapter.ts && tsx test/unit-verdict.ts && tsx test/unit-hooks.ts && tsx test/unit-hook-relay.ts && tsx test/unit-claude-canary.ts && tsx test/unit-logger.ts && tsx test/unit-bridge.ts && tsx test/unit-net.ts && tsx test/unit-adapter.ts && tsx test/unit-manager.ts && tsx test/unit-ws-replay.ts && tsx test/unit-diff.ts && tsx test/unit-net-notify.ts && tsx test/unit-embedded-bin.ts && tsx test/unit-artifact.ts && tsx test/unit-provider-surface.ts && tsx test/unit-egress.ts && tsx test/integration-gateway.ts"
   },
   "dependencies": {
     "tsx": "^4.23.0",

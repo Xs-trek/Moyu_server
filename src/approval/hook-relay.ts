@@ -1,11 +1,12 @@
-// Hidden local helper used by the Codex PreToolUse command hook.
+// Hidden local helper used by native PreToolUse command hooks.
 //
-// It deliberately talks only to the fixed localhost gateway. Unlike a bare curl command,
+// It deliberately talks only to a fixed localhost endpoint. Unlike a bare curl command,
 // it validates both the request and the hook response. Every transport, timeout, HTTP or
 // schema failure exits with code 2 and a non-empty stderr message, which Codex 0.146 treats
 // as a blocking PreToolUse result. No response body or secret is written to stderr.
 import * as http from 'node:http';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { dirname, relative, resolve } from 'node:path';
 
 const MAX_HOOK_BYTES = 1024 * 1024;
 const MAX_CONFIG_BYTES = 16 * 1024;
@@ -15,6 +16,8 @@ export interface HookRelayConfig {
   timeoutMs: number;
   secret: string;
   sessionId: string;
+  probePath?: string;
+  probeNonce?: string;
 }
 
 interface HookSpecificOutput {
@@ -34,9 +37,9 @@ function write(stream: NodeJS.WriteStream, text: string): Promise<void> {
   });
 }
 
-async function failClosed(message: string): Promise<number> {
+async function failClosed(): Promise<number> {
   try {
-    await write(process.stderr, 'blocked: ' + message + '\n');
+    await write(process.stderr, 'approval unavailable\n');
   } catch {
     // Exit 2 remains the fail-closed signal even if stderr itself is unavailable.
   }
@@ -91,7 +94,7 @@ function postToGateway(body: string, port: number, secret: string, sessionId: st
         method: 'POST',
         headers: {
           Authorization: `Bearer ${secret}`,
-          'X-Moyu-Session': sessionId,
+          'X-Local-Session': sessionId,
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
         },
@@ -132,6 +135,14 @@ export function readHookRelayConfig(path: string): HookRelayConfig {
   if (!Number.isFinite(value.timeoutMs) || value.timeoutMs! < 1 || value.timeoutMs! > 600_000) throw new Error('invalid hook timeout');
   if (typeof value.secret !== 'string' || value.secret.length < 32) throw new Error('invalid hook secret');
   if (typeof value.sessionId !== 'string' || !value.sessionId) throw new Error('invalid hook session');
+  if (value.probePath !== undefined || value.probeNonce !== undefined) {
+    if (typeof value.probePath !== 'string' || relative(dirname(resolve(path)), resolve(value.probePath)) !== 'ready') {
+      throw new Error('invalid hook probe path');
+    }
+    if (typeof value.probeNonce !== 'string' || !/^[a-f0-9]{48,128}$/.test(value.probeNonce)) {
+      throw new Error('invalid hook probe nonce');
+    }
+  }
   return value as HookRelayConfig;
 }
 
@@ -140,25 +151,35 @@ export async function runHookRelay(configPath: string): Promise<number> {
   try {
     config = readHookRelayConfig(configPath);
   } catch {
-    return await failClosed('invalid hook identity');
+    return await failClosed();
   }
   const { port, secret, sessionId, timeoutMs } = config;
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return await failClosed('invalid hook port');
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return await failClosed('invalid hook timeout');
-  if (!secret || !sessionId) return await failClosed('missing hook identity');
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return await failClosed();
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return await failClosed();
+  if (!secret || !sessionId) return await failClosed();
 
   try {
     const body = await readStdin();
     const parsedInput = JSON.parse(body) as Record<string, unknown>;
+    if (parsedInput?.hook_event_name === 'SessionStart') {
+      if (!config.probePath || !config.probeNonce) return await failClosed();
+      // The descriptor validator confines this marker to the already-private descriptor
+      // directory. Create it exclusively so a stale/forged marker fails closed. Avoid spawning
+      // an ACL-hardening helper from inside Claude's synchronous hook process: on Windows that
+      // nested process launch can be denied even though the parent directory already has a
+      // protected current-user/SYSTEM DACL whose ACEs are inherited by this new file.
+      writeFileSync(config.probePath, config.probeNonce, { flag: 'wx', mode: 0o600 });
+      return 0;
+    }
     if (!parsedInput || typeof parsedInput !== 'object' || parsedInput.hook_event_name !== 'PreToolUse') {
-      return await failClosed('invalid hook request');
+      return await failClosed();
     }
     const responseText = await postToGateway(body, port, secret, sessionId, Math.ceil(timeoutMs));
     const response = JSON.parse(responseText) as unknown;
-    if (!isValidResponse(response)) return await failClosed('invalid hook response');
+    if (!isValidResponse(response)) return await failClosed();
     await write(process.stdout, JSON.stringify(response));
     return 0;
   } catch {
-    return await failClosed('hook relay failed');
+    return await failClosed();
   }
 }

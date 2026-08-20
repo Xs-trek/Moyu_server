@@ -63,7 +63,8 @@ export const DEFAULT_ADAPTER_CONFIG: AdapterConfig = {
 //     subscription's env vars (ANTHROPIC_AUTH_TOKEN+ANTHROPIC_BASE_URL, OPENAI_API_KEY+OPENAI_BASE_URL,
 //     CLAUDE_CODE_USE_BEDROCK/VERTEX + provider creds, ...). The backend reads it 0-modify and
 //     injects via spawn env (claude). codex uses a codexHome profile (a CODEX_HOME directory
-//     whose auth.json the user pre-created via `codex login`; the backend never writes it).
+//     whose auth.json/config.toml the user pre-created); the same *.home file may append
+//     KEY=VALUE entries required by a custom model_provider.env_key. The backend never writes it.
 //
 // Principles (user-confirmed):
 //   S-key  : keys are pre-authenticated on the PC via the platform's native login; the tool
@@ -82,7 +83,8 @@ export type ProfileSourceKind = 'nativeDefault' | 'envFile' | 'codexHome';
 
 export interface ProfileSource {
   kind: ProfileSourceKind;
-  /** Absolute path to the env file (envFile only). Never contains the file's contents. */
+  /** Absolute path to the user-authored reference file (envFile or codexHome). Never contains
+   * the file's contents; a codexHome file may append provider KEY=VALUE entries. */
   path?: string;
   /** Absolute path to a CODEX_HOME directory (codexHome only). Holds the user's pre-login
    *  auth.json; the backend reads it 0-modify (existence only) and never writes it. */
@@ -115,6 +117,11 @@ export interface SanitizedAccountProfile {
   sourceKind: ProfileSourceKind;
   fields: ProfileFields;
   active: boolean;
+  /** Profile-local native CLI default, resolved from PC files/env only (never provider-probed). */
+  cliDefaultModel?: string;
+  /** Model a new session would use after applying the persisted adapter override, if any. */
+  effectiveModel?: string;
+  modelOverride?: string;
 }
 
 export interface AccountSwitchingAdapterStatus {
@@ -150,7 +157,7 @@ export interface GatewayConfig {
 }
 
 export interface NetworkConfig {
-  /** User-provided public/relay node, e.g. "tcp://203.0.113.5:11010". NO default. */
+  /** User-provided public/relay node, e.g. "tcp://47.109.138.211:11010". NO default. */
   publicNode: string;
   /** Path to easytier-core binary (vendor/PATH). If unset, controller searches default locations. */
   easytierBin?: string;
@@ -170,7 +177,7 @@ export interface AppConfig {
   gateway: GatewayConfig;
   network: NetworkConfig;
   defaultAdapter: AdapterKind;
-  approvalTimeoutSec: number; // MUST be < 600 (claude hook hard limit); default 120
+  approvalTimeoutSec: number; // 10-590 seconds; default 120
   logLevel: LogLevel;
   ptyAddon: PtyAddonConfig;
   adapters: AdaptersConfig; // v2: per-adapter approval/account config (frontend-configurable)

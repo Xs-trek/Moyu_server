@@ -219,8 +219,8 @@ check('api.openai.com is provider', isProviderHost('api.openai.com'));
 check('subdomain of provider is provider', isProviderHost('us-west.api.anthropic.com'));
 check('localhost is not provider', !isProviderHost('localhost'));
 check('127.0.0.1 is not provider', !isProviderHost('127.0.0.1'));
-check('relay IP is not provider', !isProviderHost('203.0.113.5'));
-check('relay URL host is not provider', !isProviderHost('tcp://203.0.113.5:11010'));
+check('relay IP is not provider', !isProviderHost('47.109.138.211'));
+check('relay URL host is not provider', !isProviderHost('tcp://47.109.138.211:11010'));
 
 function throws(fn: () => void): boolean {
   try {
@@ -234,7 +234,7 @@ check('assertNotProviderHost blocks api.anthropic.com', throws(() => assertNotPr
 check('assertNotProviderHost blocks api.openai.com', throws(() => assertNotProviderHost('api.openai.com')));
 check('assertNotProviderHost blocks subdomain', throws(() => assertNotProviderHost('v1.api.openai.com')));
 check('assertNotProviderHost allows localhost', !throws(() => assertNotProviderHost('localhost')));
-check('assertNotProviderHost allows relay IP', !throws(() => assertNotProviderHost('203.0.113.5')));
+check('assertNotProviderHost allows relay IP', !throws(() => assertNotProviderHost('47.109.138.211')));
 
 console.log(`egress: ${pass} pass, ${fail} fail`);
 if (fail > 0) process.exit(1);

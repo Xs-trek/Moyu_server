@@ -2,6 +2,7 @@ node_modules/
 bin/*
 !bin/README.md
 dist/
+.*.bun-build
 *.log
 config.json
 .tsbuildinfo

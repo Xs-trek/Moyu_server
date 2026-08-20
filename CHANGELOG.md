@@ -2,11 +2,23 @@
 
 本项目记录 remote-dashboard（moyu）的版本演进。日期为本地时区。
 
+## [0.0.3] - 2026-08-20 — 配对与移动端一致性定版
+
+- `moyu -init` 在后台网关就绪后立即创建并打印五分钟一次性配对字符串；`moyu -pair` 继续承担显式重新生成。
+- 初始化、帮助、Android 集成说明和验收契约使用同一配对流程，不再要求用户猜测第二条命令。
+- 与 v0.0.3 Android/WebView UI 对齐版本；OpenCode CLI 与手机独立 Chat 不进入本版范围。
+- Claude 会话仅公开 Plan / Auto / Accept Edits，并支持空闲时手动切换模式与模型；Auto 明确不受支持时只降级状态，不自动重发内容。
+- 请求模型与本轮实际模型分层，修复兼容 Base URL 回报模型名覆盖用户选择的问题。
+- 审批与失败不再写入重复 system 消息；Android 清理旧副本，前端默认折叠非正文运行记录。
+- Windows 私有目录 ACL 的设置与复核统一使用 .NET API，不再受 PowerShell 7 继承的 `PSModulePath` 影响；从 PowerShell 7 启动、退出和发布自检均保持 fail-closed。
+- Codex Profile 完整覆盖 ChatGPT OAuth、OpenAI API Key 与火山/自建 Responses 兼容端：隔离继承凭据，并允许 `.home` 按 Profile 追加原生 `env_key`，密钥值不进入前端或日志。
+
 ## [0.0.2] - 2026-08-01 — 后端设计收尾
 
 - 将 Claude/Codex 原生 CLI 流统一为稳定事件协议，补齐会话快照、断线同步、工具审批、模型与账号 profile 逐会话选择及可解释耗时指标。
-- 加固 0 感知边界：后端无 AI provider 请求路径、无探针/身份字段/隐藏提示；moyu 标记和审批密钥不进入 CLI 工具子进程环境，构建前强制执行出站静态检查。
-- Codex 0.146 审批 relay 改为内置、私有描述符驱动并 fail-closed；Claude 保持原生 HTTP hook 限制的明确降级语义。
+- 加固 0 感知边界：后端无 AI provider 请求路径、无 provider 探针或隐藏提示；发布版的结构化 CLI 调用不主动注入 Moyu/手机来源标记，构建前强制执行出站与 CLI 表面门禁。官方 Claude print / Codex exec 身份保持原样，不宣称伪装成交互式 TUI。
+- 手机设备/网络/节点/传输字段与会话语义分流；默认 CLI cwd/PWD 使用用户主目录，图片先清除显式设备元数据，Claude 图片改用原生 stream-json image block，不再注入本机路径提示。
+- Claude/Codex 审批统一为内置的本地 command hook：私有描述符、中性可执行入口、逐回合 Claude hook 可用性 canary，任一读取/执行/传输/超时/响应异常均 fail-closed。
 - 增加轻量资源上限、稳定错误码、进程树清理、无自动 AI 轮次重试，以及 `moyu -help`/`moyu init` 的一次中继与多 API/OAuth profile 指引。
 - 固化 HTML UI 与 Android WebView 胶水层边界，补齐离线多会话、本地同步、平台/profile 切换和耗时显示的前端交接协议。
 - 发布矩阵扩展为 Windows、Linux glibc/musl、macOS 共 8 个目标。

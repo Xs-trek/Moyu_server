@@ -7,8 +7,8 @@ import { execSync } from 'node:child_process';
 import { EasyTierController } from '../src/net/easytier';
 import type { NetworkConfig } from '../src/config/schema';
 
-const BIN = process.env.EASYTIER_BIN ?? 'bin/win-x64/easytier-core.exe';
-const PUB = 'tcp://203.0.113.5:11010';
+const BIN = process.env.EASYTIER_BIN ?? 'D:/CC/remote_dashboard/bin/win-x64/easytier-core.exe';
+const PUB = 'tcp://47.109.138.211:11010';
 
 let pass = 0;
 let fail = 0;

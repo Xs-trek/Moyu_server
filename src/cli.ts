@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { createConnection } from 'node:net';
+import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { loadConfig, saveConfig, configPath as getConfigPath } from './config/loader';
 import { sanitizeConfig } from './config/schema';
@@ -22,6 +23,7 @@ import { VERSION } from './version';
 import { AccountService } from './accounts/service';
 import { assertNotProviderHost } from './net/egress';
 import { isCompiledBinary } from './util/runtime';
+import { selfCheckNeutralHookExecutable } from './approval/hook-executable';
 import { existsSync } from 'node:fs';
 import { normalizeConfigPath } from './adapters/config-location';
 import { resolveClaudeConfigLocation } from './adapters/claude/auth';
@@ -46,21 +48,21 @@ export type CliAction =
   | { kind: 'pair'; configPath?: string }
   | { kind: 'exit'; configPath?: string }
   | { kind: 'selfcheck'; configPath?: string }
-  | { kind: 'hook-relay'; relayConfigPath: string }
+  | { kind: 'local-check'; relayConfigPath: string }
   | { kind: 'start'; options: RunOptions }
   | { kind: 'daemon-run'; options: RunOptions };
 
-const HELP = `moyu ${VERSION} - remote AI CLI control backend
+export const HELP = `moyu ${VERSION} - remote AI CLI control backend
 
 Usage:
-  moyu -init                 Confirm CLI config paths + relay once, start in background
+  moyu -init                 Configure relay, start in background, print a pairing string
   moyu -pair                 Print a 5-minute phone pairing string, then return
   moyu -exit                 Gracefully stop the background gateway
   moyu                       Ensure the configured gateway is running in background
   moyu -check                Diagnose readiness without starting
   moyu -token                Print the gateway auth token (for phone client)
   moyu -print-config         Print sanitized config (secrets redacted)
-  moyu -selfcheck            Verify the embedded easytier-core (build smoke test)
+  moyu -selfcheck            Verify embedded network core + local approval guard
   moyu -version              Print version
   moyu -help                 Show this help
 
@@ -73,17 +75,22 @@ Options:
 First-time setup (one relay configuration):
   1. Log in with each native CLI you use: claude / codex login.
   2. Put moyu.exe's directory on PATH (or invoke it by absolute path).
-  3. Run moyu -init and enter the EasyTier relay; the gateway starts hidden.
-  4. Run moyu -pair and enter the printed relay + pairing string on the phone.
+  3. Run moyu -init and enter the EasyTier relay; the gateway starts hidden and
+     prints a five-minute pairing string for the phone.
+  4. Run moyu -pair whenever you need a fresh pairing string.
   Re-running -init keeps the saved relay when you press Enter. Bare init/pair/exit
   remain accepted for compatibility.
 
 Multiple API/OAuth profiles (under <config-dir>/profiles):
   claude/<name>.env          Native Claude env, for example ANTHROPIC_API_KEY=...
                              or ANTHROPIC_AUTH_TOKEN=... + ANTHROPIC_BASE_URL=...
-  codex/<name>.home          One line containing a pre-logged-in CODEX_HOME path.
+                             or CLAUDE_CODE_OAUTH_TOKEN=... from claude setup-token;
+                             or CLAUDE_CONFIG_DIR=<pre-logged-in OAuth config dir>.
+  codex/<name>.home          First line: a pre-configured CODEX_HOME path.
                              POSIX: CODEX_HOME=<dir> codex login
                              PowerShell: $env:CODEX_HOME='<dir>'; codex login
+                             Custom provider: configure model_provider/base_url/env_key in
+                             config.toml, then append that env key as KEY=VALUE here.
   OAuth and token exchange are always performed by the native CLI, never by moyu.
 
 Native CLI config directories (auto-detected; confirm/override during -init):
@@ -180,7 +187,7 @@ export function parseArgs(argv: string[]): CliAction {
       command = a;
       continue;
     }
-    if (command === 'hook-relay' && !relayConfigPath) {
+    if (command === 'local-check' && !relayConfigPath) {
       relayConfigPath = a;
       continue;
     }
@@ -193,10 +200,10 @@ export function parseArgs(argv: string[]): CliAction {
   if (command === 'exit' || flags.has('exit')) return { kind: 'exit', configPath };
   // Internal subprocess contract used only by the injected Codex hook. Intentionally
   // omitted from --help: it is authenticated by a mode-0600 per-session descriptor.
-  if (command === 'hook-relay') {
+  if (command === 'local-check') {
     return relayConfigPath
-      ? { kind: 'hook-relay', relayConfigPath }
-      : { kind: 'usage', message: 'hook-relay requires a descriptor path' };
+      ? { kind: 'local-check', relayConfigPath }
+      : { kind: 'usage', message: 'local-check requires a descriptor path' };
   }
   if (command) return { kind: 'usage', message: `unknown command ${command}` };
   if (flags.has('check')) return { kind: 'check', configPath };
@@ -310,8 +317,12 @@ export async function runPrintConfig(configPath?: string): Promise<number> {
 export async function runSelfCheck(): Promise<number> {
   const r = await selfCheckEmbeddedBin();
   if (r.ok) {
-    console.log(`moyu -selfcheck: OK (embedded easytier-core ${r.version})`);
-    console.log(`  extracted: ${r.path}`);
+    const hook = selfCheckNeutralHookExecutable();
+    if (!hook.ok) {
+      console.error(`moyu -selfcheck: FAIL (${hook.error ?? 'local command alias unavailable'})`);
+      return 1;
+    }
+    console.log(`moyu -selfcheck: OK (embedded easytier-core ${r.version}; local approval guard ready)`);
     return 0;
   }
   if (r.error === 'no embedded easytier-core (dev/source mode)') {
@@ -520,7 +531,10 @@ export async function ensureBackgroundGateway(options: RunOptions = {}): Promise
   if (options.port !== undefined) args.push('-port', String(options.port));
   if (options.logLevel !== undefined) args.push('-log-level', options.logLevel);
   const child = spawn(process.execPath, args, {
-    cwd: process.cwd(),
+    // A caller may launch the installed binary from a product/source directory. The detached
+    // daemon must not make that directory the implicit cwd of native CLI subprocesses or other
+    // local children. Relative config input was resolved above, so home is a neutral base.
+    cwd: homedir(),
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
@@ -542,7 +556,7 @@ export async function ensureBackgroundGateway(options: RunOptions = {}): Promise
     await new Promise((done) => setTimeout(done, 200));
   }
   console.error(`moyu failed to start in background${spawnError ? `: ${spawnError.message}` : '.'}`);
-  console.error('run `moyu -check` and inspect the local configuration.');
+  console.error('run `moyu -selfcheck` and `moyu -check` to inspect local runtime support and configuration.');
   return 1;
 }
 
@@ -620,4 +634,30 @@ export async function runPair(configPath?: string): Promise<number> {
   console.log(`pair:  ${res.pairString}`);
   console.log('valid for 5 minutes; this command may now be closed.');
   return 0;
+}
+
+export interface InitLifecycle {
+  init(configPath?: string): Promise<number>;
+  stop(configPath?: string, quiet?: boolean): Promise<number>;
+  start(configPath?: string): Promise<number>;
+  pair(configPath?: string): Promise<number>;
+  notify(message: string): void;
+}
+
+/** The public init contract is one atomic operator workflow: configure, restart the daemon,
+ * wait until it is reachable, then create pairing material. Keeping the sequence testable here
+ * prevents the CLI dispatcher and the help/Android instructions from drifting apart again. */
+export async function runInitLifecycle(configPath?: string, lifecycle: InitLifecycle = {
+  init: runInit,
+  stop: runExit,
+  start: async (path) => ensureBackgroundGateway({ configPath: path }),
+  pair: runPair,
+  notify: (message) => console.log(message),
+}): Promise<number> {
+  if (await lifecycle.init(configPath)) return 1;
+  if (await lifecycle.stop(configPath, true)) return 1;
+  const ready = await lifecycle.start(configPath);
+  if (ready !== 0) return ready;
+  lifecycle.notify('\nGateway ready. Creating a one-time phone pairing string...');
+  return lifecycle.pair(configPath);
 }
