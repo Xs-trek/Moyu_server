@@ -1,13 +1,55 @@
-// Read-only discovery of the OpenCode Desktop application. Desktop's built-in sidecar is not
-// attachable: it owns an ephemeral random Basic-auth credential. Discovery is presentation/setup
-// evidence only; Moyu never reads Desktop stores, its database, or private IPC state.
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+// Read-only discovery of the OpenCode Desktop application and an official service-capable CLI
+// if a release actually bundles/stages one. Production 1.18.21 does not, so absence is an
+// expected, explicit state; Moyu never scrapes v1 sidecar IPC, process memory or credentials.
+import { existsSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { getPlatform } from '../../util/platform';
 
 export interface OpenCodeDesktopInstall {
   path: string;
+  serviceCliPath?: string;
+  /** Official Desktop service discovery locations; values are paths only, never credentials. */
+  serviceStateHomes?: string[];
+}
+
+function appDataRoots(platform: string): string[] {
+  return (platform === 'windows'
+    ? [process.env.APPDATA]
+    : platform === 'darwin'
+      ? [join(homedir(), 'Library', 'Application Support')]
+      : [process.env.XDG_CONFIG_HOME, join(homedir(), '.config')]).filter((value): value is string => Boolean(value));
+}
+
+function serviceStateHomes(platform: string): string[] {
+  const homes: string[] = [];
+  for (const appData of appDataRoots(platform)) {
+    for (const name of ['ai.opencode.desktop', 'ai.opencode.desktop.beta', 'ai.opencode.desktop.dev']) {
+      const value = join(appData, name);
+      if (existsSync(value)) homes.push(value);
+    }
+  }
+  return homes;
+}
+
+function serviceCliForDesktop(path: string, platform: string): string | undefined {
+  const bundled = platform === 'windows'
+    ? [join(dirname(path), 'resources', 'opencode-cli.exe')]
+    : platform === 'darwin'
+      ? [join(path, 'Contents', 'Resources', 'opencode-cli'), join(path, 'Contents', 'MacOS', 'opencode-cli')]
+      : [join(dirname(path), 'resources', 'opencode-cli'), join(dirname(path), 'opencode-cli')];
+  const staged: string[] = [];
+  for (const appData of appDataRoots(platform)) {
+    for (const name of ['ai.opencode.desktop', 'ai.opencode.desktop.beta', 'ai.opencode.desktop.dev']) {
+      const root = join(appData, name, 'cli');
+      try {
+        for (const version of readdirSync(root).sort().reverse()) {
+          staged.push(join(root, version, platform === 'windows' ? 'opencode-cli.exe' : 'opencode-cli'));
+        }
+      } catch { /* no staged v2 CLI */ }
+    }
+  }
+  return [...bundled, ...staged].find((candidate) => existsSync(candidate));
 }
 
 export function detectOpenCodeDesktop(): OpenCodeDesktopInstall | null {
@@ -30,5 +72,5 @@ export function detectOpenCodeDesktop(): OpenCodeDesktopInstall | null {
     }
   }
   const path = candidates.find((candidate) => existsSync(candidate));
-  return path ? { path } : null;
+  return path ? { path, serviceCliPath: serviceCliForDesktop(path, platform), serviceStateHomes: serviceStateHomes(platform) } : null;
 }

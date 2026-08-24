@@ -101,10 +101,10 @@ Multiple API/OAuth profiles (under <config-dir>/profiles):
 Claude/Codex configuration directories (auto-detected; confirm/override during -init):
   Claude: adapters.claude.configDir > CLAUDE_CONFIG_DIR > ~/.claude
   Codex:  adapters.codex.configDir  > CODEX_HOME        > ~/.codex
-  OpenCode: -init generates a stable PC-local Basic-auth credential. Managed mode starts one
-            official loopback opencode serve; attach uses adapters.opencode.serverUrl.
-            To share Desktop history, add that local Server URL in OpenCode Desktop once and
-            select it as default. Desktop's private random-credential sidecar is never scraped.
+  OpenCode: when Desktop ships/stages its official service-capable CLI, moyu auto-attaches that
+            shared loopback Service. Production Desktop 1.18.21 still lacks this binary; its v1
+            random-credential sidecar has no supported external attach API, so an explicit
+            official CLI managed Server or attach URL remains required for that release.
             Provider setup remains owned by OpenCode; moyu never performs provider requests.
   These PC-local paths cannot be changed by the phone API.
 
@@ -231,7 +231,7 @@ interface DetectResult {
   claudeMode: string;
   codexMode: string;
   opencodeMode: string;
-  opencodeServerMode: 'managed' | 'attach';
+  opencodeServerMode: 'desktop-service' | 'managed' | 'attach';
   opencodeServerUrl: string;
   opencodeVersion?: string;
   opencodeReason?: string;
@@ -273,7 +273,7 @@ async function detect(configPath?: string): Promise<DetectResult> {
     claude.detect(),
     codex.detect(),
   ]);
-  const opencodeServerMode = cfg.adapters.opencode.serverMode === 'attach' ? 'attach' : 'managed';
+  let opencodeServerMode: DetectResult['opencodeServerMode'] = cfg.adapters.opencode.serverMode === 'attach' ? 'attach' : 'managed';
   const opencodeServerUrl = cfg.adapters.opencode.serverUrl ?? 'http://127.0.0.1:4096';
   const opencodeDesktop = detectOpenCodeDesktop();
   const opencodePassword = process.env.OPENCODE_SERVER_PASSWORD
@@ -297,12 +297,15 @@ async function detect(configPath?: string): Promise<DetectResult> {
       opencodeReason = error instanceof Error ? error.message : 'Server unavailable';
     }
   } else {
-    opencodeCliBin = resolveOpenCodeBinary(cfg.adapters.opencode.bin);
+    opencodeCliBin = cfg.adapters.opencode.bin
+      ? resolveOpenCodeBinary(cfg.adapters.opencode.bin)
+      : opencodeDesktop?.serviceCliPath ?? resolveOpenCodeBinary();
+    if (!cfg.adapters.opencode.bin && opencodeDesktop?.serviceCliPath) opencodeServerMode = 'desktop-service';
     const version = opencodeCliBin ? await probeVersion(opencodeCliBin) : { ok: false as const };
     opencodeVersion = version.version;
     opencodeAvail = version.ok && supportedOpenCodeVersion(version.version);
     if (!opencodeCliBin) opencodeReason = opencodeDesktop
-      ? 'Desktop found; install the official OpenCode CLI to host a stable shared Server'
+      ? 'Desktop found without Service support; upgrade Desktop or configure an official CLI path'
       : 'official OpenCode CLI not found';
     else if (!opencodeAvail) opencodeReason = 'unsupported OpenCode CLI version';
   }
@@ -497,14 +500,16 @@ export async function runInit(configPath?: string): Promise<number> {
   console.log(`  profiles: ${profileLayout.root}`);
   console.log('  phone credentials: generated and stored locally (delivered by pairing)');
   console.log('  add Claude <name>.env or Codex <name>.home files only if you need multiple accounts');
-  if (d.opencodeCliBin && cfg.adapters.opencode.serverMode !== 'attach') {
+  if (d.opencodeServerMode === 'desktop-service') {
+    console.log('  OpenCode Desktop shared Service: detected; no additional CLI or Server entry is required.');
+  } else if (d.opencodeCliBin && cfg.adapters.opencode.serverMode !== 'attach') {
     console.log('  OpenCode shared Server (add once in Desktop -> Servers, then set as default):');
     console.log(`    URL:      ${cfg.adapters.opencode.serverUrl ?? 'http://127.0.0.1:4096'}`);
     console.log(`    username: ${cfg.adapters.opencode.serverUsername ?? 'opencode'}`);
     console.log(`    password: ${cfg.adapters.opencode.serverPassword}`);
   } else if (d.opencodeDesktopPath && !d.opencodeCliBin) {
-    console.log('  OpenCode Desktop detected, but its private sidecar cannot be safely attached.');
-    console.log('  Install the matching official OpenCode CLI, rerun `moyu -init`, then add the printed local Server in Desktop once.');
+    console.log('  OpenCode Desktop detected without shared Service support.');
+    console.log('  Upgrade Desktop or configure a matching official CLI path, then rerun `moyu -init`.');
   }
   console.log('\nInitialization saved. Starting the gateway in background...');
   return 0;

@@ -78,6 +78,9 @@ interface SessionRecord {
   /** Local wall-clock observation from accepted user input through terminal completion. It is
    * never exposed except as the bounded elapsed duration added to turn.completed. */
   turnStartedAtMs?: number;
+  /** First non-empty assistant-visible output for the active turn. Thinking/tool events do not
+   * count, so the value matches the first visible response shown on the phone. */
+  firstOutputAtMs?: number;
   transport: TransportMetrics;
   pendingInputAt: Array<{ acceptedAt: number }>;
   eventDroppedThroughSeq: number;
@@ -296,12 +299,22 @@ export class SessionManager {
     ev = boundAdapterEvent(ev);
     const now = this.nowMs();
     r.updatedAt = new Date(now).toISOString();
+    const firstVisibleOutput = (ev.type === 'text.delta' || ev.type === 'text.done')
+      ? ev.text.trim().length > 0
+      : ev.type === 'message.upsert'
+        && ev.message.role === 'assistant'
+        && Boolean(ev.message.text?.trim().length);
+    if (firstVisibleOutput && r.firstOutputAtMs === undefined
+      && (r.turnStartedAtMs !== undefined || r.pendingInputAt.length > 0)) {
+      r.firstOutputAtMs = now;
+    }
     if (ev.type === 'turn.started') {
       r.turnState = 'running';
       const pending = r.pendingInputAt.shift();
       // The accepted timestamp also covers adapter queueing and pre-spawn safety checks. This
       // makes the reported duration match what the remote user actually waited for.
       r.turnStartedAtMs = pending?.acceptedAt ?? now;
+      r.firstOutputAtMs = undefined;
       this.publish(r, ev);
       if (pending) {
         this.publish(r, {
@@ -320,18 +333,36 @@ export class SessionManager {
       // input timestamp rather than dropping timing or leaving the queue misaligned.
       const observedStart = r.turnStartedAtMs ?? r.pendingInputAt.shift()?.acceptedAt;
       if (observedStart !== undefined) {
+        const observedDurationMs = Math.max(0, Math.round(now - observedStart));
+        const timeToFirstOutputMs = r.firstOutputAtMs === undefined
+          ? undefined : Math.max(0, Math.round(r.firstOutputAtMs - observedStart));
+        const outputDurationMs = r.firstOutputAtMs === undefined
+          ? undefined : Math.max(0, Math.round(now - r.firstOutputAtMs));
+        const outputTokens = ev.usage?.outputTokens;
+        const outputTokensPerSecond = outputDurationMs !== undefined && outputDurationMs > 0
+          && typeof outputTokens === 'number' && Number.isFinite(outputTokens) && outputTokens > 0
+          ? outputTokens * 1_000 / outputDurationMs
+          : undefined;
         ev = {
           ...ev,
-          performance: { observedDurationMs: Math.max(0, Math.round(now - observedStart)) },
+          performance: {
+            ...ev.performance,
+            observedDurationMs,
+            timeToFirstOutputMs,
+            outputDurationMs,
+            outputTokensPerSecond,
+          },
         };
       }
       r.turnStartedAtMs = undefined;
+      r.firstOutputAtMs = undefined;
     } else if (ev.type === 'turn.failed') {
       r.turnState = 'failed';
       // A pre-start guard/spawn failure still consumes exactly one accepted input. Removing it
       // here prevents the next healthy turn from inheriting the failed turn's start time.
       if (r.turnStartedAtMs === undefined) r.pendingInputAt.shift();
       r.turnStartedAtMs = undefined;
+      r.firstOutputAtMs = undefined;
     }
     r.permissionMode = r.handle.permissionMode ?? r.permissionMode;
     this.publish(r, ev);

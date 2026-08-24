@@ -232,12 +232,18 @@ function stringifyToolOutput(value: unknown): string | undefined {
 
 function mapUsage(value: unknown): Usage | undefined {
   if (!value || typeof value !== 'object') return undefined;
-  const u = value as Record<string, number>;
+  const u = value as Record<string, unknown>;
+  const details = (u.output_tokens_details ?? u.outputTokensDetails) as Record<string, unknown> | undefined;
+  const number = (...values: unknown[]): number | undefined => {
+    const value = values.find((candidate) => typeof candidate === 'number' && Number.isFinite(candidate));
+    return value as number | undefined;
+  };
   return {
-    inputTokens: u.input_tokens ?? u.inputTokens,
-    outputTokens: u.output_tokens ?? u.outputTokens,
-    cacheReadTokens: u.cached_input_tokens ?? u.cached_tokens ?? u.cacheReadTokens,
-    cacheWriteTokens: u.cache_write_input_tokens ?? u.cacheWriteTokens,
+    inputTokens: number(u.input_tokens, u.inputTokens),
+    outputTokens: number(u.output_tokens, u.outputTokens),
+    cacheReadTokens: number(u.cached_input_tokens, u.cached_tokens, u.cacheReadTokens),
+    cacheWriteTokens: number(u.cache_write_input_tokens, u.cacheWriteTokens),
+    reasoningTokens: number(u.reasoning_tokens, u.reasoning_output_tokens, u.reasoningTokens, details?.reasoning_tokens, details?.reasoningTokens),
   };
 }
 

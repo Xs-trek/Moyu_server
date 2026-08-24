@@ -9,8 +9,9 @@ import type { AdapterConfig } from '../../config/schema';
 import { categorizeError, log, registerEnvSecrets, registerSecrets, safeStderrSummary } from '../../util/logger';
 import { getArch, getPlatform, isWindows } from '../../util/platform';
 import { scrubMoyuEnv } from '../../util/runtime';
-import { probeVersion, which } from '../../util/spawn';
+import { probeVersion, run, which } from '../../util/spawn';
 import { normalizeLoopbackServerUrl, OpenCodeClient, type OpenCodeGlobalEvent } from './client';
+import { detectOpenCodeDesktop, type OpenCodeDesktopInstall } from './desktop';
 
 export interface OpenCodeRuntimeOptions {
   adapterConfig: AdapterConfig;
@@ -41,6 +42,8 @@ export interface OpenCodeRuntimeDeps {
   spawn?: typeof spawn;
   resolveBinary?: typeof resolveOpenCodeBinary;
   probeVersion?: typeof probeVersion;
+  run?: typeof run;
+  detectDesktop?: typeof detectOpenCodeDesktop;
 }
 
 interface Listener {
@@ -113,16 +116,21 @@ export class OpenCodeServerRuntime {
     return this.opts.adapterConfig.serverMode === 'attach' ? 'attach' : 'managed';
   }
 
+  private desktopInstall(): OpenCodeDesktopInstall | null {
+    if (this.opts.adapterConfig.bin) return null;
+    return (this.runtimeDeps.detectDesktop ?? detectOpenCodeDesktop)();
+  }
+
   async binaryCompatibility(): Promise<AdapterCompatibility> {
     if (this.mode() === 'attach') return this.compatibility();
-    const bin = this.resolveBinary(this.opts.adapterConfig.bin);
+    const bin = this.desktopInstall()?.serviceCliPath ?? this.resolveBinary(this.opts.adapterConfig.bin);
     if (!bin) {
-      return { state: 'unavailable', protocol: 'opencode-server-api', reason: 'OpenCode executable for managed Server mode is unavailable' };
+      return { state: 'unavailable', protocol: 'opencode-server-api', reason: 'OpenCode Desktop service CLI or managed Server executable is unavailable' };
     }
     const result = await (this.runtimeDeps.probeVersion ?? probeVersion)(bin);
     return result.ok
       ? { state: 'unknown', protocol: 'opencode-server-api', version: result.version }
-      : { state: 'unavailable', protocol: 'opencode-server-api', reason: 'OpenCode managed Server executable version probe failed' };
+      : { state: 'unavailable', protocol: 'opencode-server-api', reason: 'OpenCode Server executable version probe failed' };
   }
 
   async compatibility(): Promise<AdapterCompatibility> {
@@ -183,21 +191,30 @@ export class OpenCodeServerRuntime {
   }
 
   private async initialize(): Promise<OpenCodeClient> {
-    const username = this.opts.username ?? this.opts.adapterConfig.serverUsername
+    let username = this.opts.username ?? this.opts.adapterConfig.serverUsername
       ?? process.env.OPENCODE_SERVER_USERNAME ?? 'opencode';
-    const password = this.opts.password ?? this.opts.adapterConfig.serverPassword
+    let password = this.opts.password ?? this.opts.adapterConfig.serverPassword
       ?? process.env.OPENCODE_SERVER_PASSWORD;
     let baseUrl: string;
     if (this.mode() === 'attach') {
       baseUrl = this.opts.adapterConfig.serverUrl ?? 'http://127.0.0.1:4096';
     } else {
-      const bin = this.resolveBinary(this.opts.adapterConfig.bin);
-    if (!bin) throw new Error('OpenCode executable not found for managed Server mode; set adapters.opencode.bin, install OpenCode, or use attach mode');
-      baseUrl = normalizeLoopbackServerUrl(this.opts.adapterConfig.serverUrl ?? 'http://127.0.0.1:4096');
-      const parsed = new URL(baseUrl);
-      const port = Number(parsed.port || 80);
-      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid OpenCode managed server port');
-      await this.startManaged(bin, port, username, password);
+      const desktop = this.desktopInstall();
+      const serviceCli = desktop?.serviceCliPath;
+      if (serviceCli) {
+        const service = await this.ensureDesktopService(serviceCli, desktop.serviceStateHomes);
+        baseUrl = service.baseUrl;
+        username = service.username;
+        password = service.password;
+      } else {
+        const bin = this.resolveBinary(this.opts.adapterConfig.bin);
+        if (!bin) throw new Error('OpenCode executable not found; upgrade Desktop for shared Service support, set adapters.opencode.bin, or use attach mode');
+        baseUrl = normalizeLoopbackServerUrl(this.opts.adapterConfig.serverUrl ?? 'http://127.0.0.1:4096');
+        const parsed = new URL(baseUrl);
+        const port = Number(parsed.port || 80);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid OpenCode managed server port');
+        await this.startManaged(bin, port, username, password);
+      }
     }
     const client = new OpenCodeClient(baseUrl, username, password);
     const deadline = Date.now() + 15_000;
@@ -261,12 +278,59 @@ export class OpenCodeServerRuntime {
     };
     this.startEventLoop();
     log.info('shared OpenCode server ready', {
-      mode: this.mode(),
+      mode: this.childOwned ? 'managed' : this.mode() === 'attach' ? 'attach' : 'desktop-service',
       version: healthVersion,
       url: client.baseUrl,
       ownership: this.childOwned ? 'moyu' : 'external',
     });
     return client;
+  }
+
+  private serviceUrl(output: string): string | null {
+    const match = /https?:\/\/[^\s]+/i.exec(output);
+    if (!match) return null;
+    try { return normalizeLoopbackServerUrl(match[0].replace(/[),.;]+$/, '')); }
+    catch { return null; }
+  }
+
+  private async ensureDesktopService(bin: string, desktopStateHomes: string[] = []): Promise<{ baseUrl: string; username: string; password: string }> {
+    const execute = this.runtimeDeps.run ?? run;
+    const stateHomes = [...new Set([process.env.XDG_STATE_HOME, undefined, ...desktopStateHomes])];
+    let selectedStateHome: string | undefined;
+    let baseUrl: string | null = null;
+    for (const stateHome of stateHomes) {
+      const candidateEnv = scrubMoyuEnv(process.env, undefined, homedir());
+      if (stateHome === undefined) delete candidateEnv.XDG_STATE_HOME;
+      else candidateEnv.XDG_STATE_HOME = stateHome;
+      const status = await execute(bin, ['service', 'status'], { timeout: 8_000, env: candidateEnv, cwd: homedir() });
+      baseUrl = this.serviceUrl(`${status.stdout}\n${status.stderr}`);
+      if (baseUrl) {
+        selectedStateHome = stateHome;
+        break;
+      }
+    }
+    const env = scrubMoyuEnv(process.env, undefined, homedir());
+    if (selectedStateHome === undefined) delete env.XDG_STATE_HOME;
+    else env.XDG_STATE_HOME = selectedStateHome;
+    if (!baseUrl) {
+      const started = await execute(bin, ['service', 'start'], { timeout: 15_000, env, cwd: homedir() });
+      if (started.code !== 0) {
+        throw new Error(`OpenCode Desktop service failed to start (${categorizeError(started.stderr)})`);
+      }
+      baseUrl = this.serviceUrl(`${started.stdout}\n${started.stderr}`);
+      if (!baseUrl) {
+        const retry = await execute(bin, ['service', 'status'], { timeout: 8_000, env, cwd: homedir() });
+        baseUrl = this.serviceUrl(`${retry.stdout}\n${retry.stderr}`);
+      }
+    }
+    if (!baseUrl) throw new Error('OpenCode Desktop service did not report a loopback URL');
+    const passwordResult = await execute(bin, ['service', 'get', 'password'], { timeout: 8_000, env, cwd: homedir() });
+    const password = passwordResult.stdout.trim();
+    if (passwordResult.code !== 0 || !password || /\r|\n/.test(password)) {
+      throw new Error('OpenCode Desktop service password is unavailable');
+    }
+    registerSecrets(password);
+    return { baseUrl, username: 'opencode', password };
   }
 
   private async startManaged(bin: string, port: number, username: string, password?: string): Promise<void> {

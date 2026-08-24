@@ -45,7 +45,7 @@ if (scenario === 'text+tool' || scenario === 'tool-failed') {
   emit({ type: 'turn.started', turn_id: 'mock-turn-1' });
   agentMessage();
   commandExecution({ failed: scenario === 'tool-failed' });
-  emit({ type: 'turn.completed', usage: { input_tokens: 100, output_tokens: 50, cached_input_tokens: 80, cache_write_input_tokens: 10 } });
+  emit({ type: 'turn.completed', usage: { input_tokens: 100, output_tokens: 50, cached_input_tokens: 80, cache_write_input_tokens: 10, output_tokens_details: { reasoning_tokens: 7 } } });
   process.exit(0);
 } else if (scenario === 'text-only') {
   emit({ type: 'thread.started', thread_id: THREAD_ID });

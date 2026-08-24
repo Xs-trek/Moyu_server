@@ -188,13 +188,16 @@ export class ClaudeStreamParser {
   private onResult(o: Record<string, unknown>): void {
     if (this.done) return;
     this.done = true;
-    const usageRaw = o.usage as Record<string, number> | undefined;
+    const usageRaw = o.usage as Record<string, unknown> | undefined;
+    const outputDetails = usageRaw?.output_tokens_details as Record<string, unknown> | undefined;
+    const token = (value: unknown): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined;
     const usage: Usage | undefined = usageRaw
       ? {
-          inputTokens: usageRaw.input_tokens,
-          outputTokens: usageRaw.output_tokens,
-          cacheReadTokens: usageRaw.cache_read_input_tokens,
-          cacheWriteTokens: usageRaw.cache_creation_input_tokens,
+          inputTokens: token(usageRaw.input_tokens),
+          outputTokens: token(usageRaw.output_tokens),
+          cacheReadTokens: token(usageRaw.cache_read_input_tokens),
+          cacheWriteTokens: token(usageRaw.cache_creation_input_tokens),
+          reasoningTokens: token(usageRaw.reasoning_tokens ?? outputDetails?.reasoning_tokens),
         }
       : undefined;
     const costUsd = typeof o.total_cost_usd === 'number' ? o.total_cost_usd : undefined;

@@ -54,6 +54,7 @@ class MockOpenCodeServer {
   oversizedHealth = false;
   wrongEventContentType = false;
   readonly expectedAuthorization = `Basic ${Buffer.from('tester:secret').toString('base64')}`;
+  readonly serviceAuthorization = `Basic ${Buffer.from('opencode:secret').toString('base64')}`;
 
   constructor() {
     this.server = createServer((req, res) => { void this.handle(req, res); });
@@ -102,7 +103,7 @@ class MockOpenCodeServer {
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     this.authHeaders.push(req.headers.authorization);
-    if (req.headers.authorization !== this.expectedAuthorization) {
+    if (req.headers.authorization !== this.expectedAuthorization && req.headers.authorization !== this.serviceAuthorization) {
       this.json(res, { error: 'unauthorized' }, 401);
       return;
     }
@@ -289,7 +290,7 @@ async function main(): Promise<void> {
     const assistantInfo = {
       id: 'msg_assistant_1', sessionID: firstId, role: 'assistant' as const,
       time: { created: Date.now(), completed: Date.now() }, providerID: 'anthropic', modelID: 'claude-sonnet-4-5',
-      tokens: { input: 12, output: 4, cache: { read: 3, write: 1 } }, cost: 0.01,
+      tokens: { input: 12, output: 4, reasoning: 2, cache: { read: 3, write: 1 } }, cost: 0.01,
     };
     const assistantPart = { id: 'part_assistant_1', sessionID: firstId, messageID: assistantInfo.id, type: 'text', text: 'world' };
     mock.addMessage(firstId, { info: assistantInfo, parts: [assistantPart] });
@@ -300,6 +301,7 @@ async function main(): Promise<void> {
     const completed = await waitFor(() => firstEvents.find((event) => event.type === 'turn.completed'));
     check('SSE maps streaming and canonical upsert events', firstEvents.some((event) => event.type === 'text.delta') && firstEvents.some((event) => event.type === 'message.upsert'));
     check('completion maps usage and runtime model', completed.type === 'turn.completed' && completed.usage?.inputTokens === 12 && completed.model === 'anthropic/claude-sonnet-4-5');
+    check('completion maps explicit reasoning tokens', completed.type === 'turn.completed' && completed.usage?.reasoningTokens === 2);
 
     mock.broadcast(firstId, 'permission.updated', {
       id: 'perm_1', sessionID: firstId, messageID: assistantInfo.id, type: 'bash', title: 'Run command', metadata: { command: 'echo ok' }, time: { created: Date.now() },
@@ -339,6 +341,28 @@ async function main(): Promise<void> {
     await waitFor(() => mock.activeEventStreams === 0 ? true : undefined);
     check('attach adapter dispose closes only Moyu SSE', (await direct.health()).healthy);
     check('Basic Auth is sent on every OpenCode request', mock.authHeaders.every((value) => value === mock.expectedAuthorization));
+
+    const serviceCommands: string[] = [];
+    let serviceSpawnCount = 0;
+    const desktopService = new OpenCodeServerRuntime({
+      adapterConfig: { ...DEFAULT_ADAPTER_CONFIG, serverMode: 'managed' },
+    }, {
+      detectDesktop: () => ({ path: 'OpenCode.exe', serviceCliPath: 'opencode-cli.exe', serviceStateHomes: ['desktop-state'] }),
+      probeVersion: async () => ({ ok: true, version: '1.18.19' }),
+      run: async (_cmd, args, opts) => {
+        serviceCommands.push(args.join(' '));
+        if (args.join(' ') === 'service status' && opts.env?.XDG_STATE_HOME === 'desktop-state') return { code: 0, stdout: `running ${serverUrl}\n`, stderr: '' };
+        if (args.join(' ') === 'service status') return { code: 0, stdout: 'stopped\n', stderr: '' };
+        if (args.join(' ') === 'service get password') return { code: 0, stdout: 'secret\n', stderr: '' };
+        return { code: 1, stdout: '', stderr: 'unexpected command' };
+      },
+      spawn: ((..._args: unknown[]) => { serviceSpawnCount++; return new FakeChild() as unknown as ChildProcess; }) as never,
+    });
+    await desktopService.ensureReady();
+    check('Desktop Service mode discovers status and password without spawning serve',
+      serviceSpawnCount === 0 && serviceCommands.join('|') === 'service status|service status|service get password');
+    await desktopService.dispose();
+    check('disposing Moyu never stops the Desktop-owned Service', !serviceCommands.some((value) => value.includes('service stop')));
 
     const fakeChild = new FakeChild();
     let spawnCount = 0;

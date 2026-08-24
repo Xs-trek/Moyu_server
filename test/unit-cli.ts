@@ -12,10 +12,10 @@ check('moyu -help accepted', parseArgs(['-help']).kind === 'help');
 check('help documents Claude multi-OAuth configuration',
   HELP.includes('CLAUDE_CODE_OAUTH_TOKEN=...') &&
   HELP.includes('CLAUDE_CONFIG_DIR=<pre-logged-in OAuth config dir>'));
-check('help documents one-time shared OpenCode Server setup',
-  HELP.includes('stable PC-local Basic-auth credential')
-  && HELP.includes('add that local Server URL in OpenCode Desktop once')
-  && HELP.includes('private random-credential sidecar is never scraped'));
+check('help documents safe OpenCode Desktop Service detection and v1 limitation',
+  HELP.includes('official service-capable CLI')
+  && HELP.includes('Production Desktop 1.18.21 still lacks this binary')
+  && HELP.includes('random-credential sidecar has no supported external attach API'));
 check('moyu --help accepted', parseArgs(['--help']).kind === 'help');
 check('moyu -h accepted', parseArgs(['-h']).kind === 'help');
 check('moyu -init accepted', parseArgs(['-init']).kind === 'init');

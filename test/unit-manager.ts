@@ -101,11 +101,17 @@ emit({ type: 'text.done', text: 'done listing' });
 let runningEffortRejected = false;
 try { await mgr.setEffort(sid, 'high'); } catch { runningEffortRejected = true; }
 check('effort change is rejected while a turn runs', runningEffortRejected);
+observedNowMs = 4_000;
 emit({ type: 'turn.completed', usage: { inputTokens: 10, outputTokens: 3 }, model: 'runtime-native-model' });
 const completedEnvelope = mgr.sync(sid, 0).events.find((item) => item.event.type === 'turn.completed');
 check('completed turn carries the locally observed end-to-end duration',
   completedEnvelope?.event.type === 'turn.completed'
-    && completedEnvelope.event.performance?.observedDurationMs === 2_500);
+    && completedEnvelope.event.performance?.observedDurationMs === 3_000);
+check('completed turn carries first-output latency, output phase duration and output speed',
+  completedEnvelope?.event.type === 'turn.completed'
+    && completedEnvelope.event.performance?.timeToFirstOutputMs === 2_500
+    && completedEnvelope.event.performance?.outputDurationMs === 500
+    && completedEnvelope.event.performance?.outputTokensPerSecond === 6);
 const effortSummary = await mgr.setEffort(sid, 'high');
 check('effort change reaches the native session handle', selectedEffort === 'high');
 check('session summary exposes selected effort', effortSummary.effort === 'high');

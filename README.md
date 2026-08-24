@@ -51,8 +51,13 @@ Server，不要求 Moyu 能找到 OpenCode 可执行文件，也不会停止外�
 为 managed Server 自动生成稳定的 Basic Auth 口令并仅存入受保护的 PC 配置；
 `OPENCODE_SERVER_PASSWORD` 可作为本机覆盖值，所有 Server 配置和口令均不会投影到手机。
 
-OpenCode Desktop 的内置 sidecar 会为每次启动生成私有随机口令，Moyu 不抓取该口令或
-Desktop 私有状态。要共享同一历史/数据库，安装官方 OpenCode CLI，运行一次
+若未来/特定 Desktop 构建实际随包或已暂存官方 service-capable CLI，Moyu 会自动发现并只
+调用其公开的 `service status/start/get password`，作为第三种 `desktop-service` 有效模式；
+该服务始终由 Desktop 所有，Moyu 退出时不会停止它。
+
+OpenCode Desktop 1.18.21 的正式安装包仍未包含 service-capable CLI；其 v1 内置 sidecar
+会为每次启动生成私有随机口令并只通过 Electron 私有 IPC 交给 renderer。Moyu 不抓取该
+口令或 Desktop 私有状态。要在该版本共享同一历史/数据库，安装匹配的官方 OpenCode CLI，运行一次
 `moyu -init`，再在 Desktop 的 Servers 页面添加 init 打印的 loopback URL、用户名和口令并
 设为默认。之后 Desktop 与 Moyu 都是同一官方 Server 的客户端；无需在 Moyu 中配置模型
 provider/API key，订阅与 provider 配置继续由 OpenCode 管理。

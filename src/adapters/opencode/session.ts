@@ -325,6 +325,7 @@ export class OpenCodeSession implements SessionHandle {
       const usage: Usage | undefined = assistant?.tokens ? {
         inputTokens: assistant.tokens.input,
         outputTokens: assistant.tokens.output,
+        reasoningTokens: assistant.tokens.reasoning,
         cacheReadTokens: assistant.tokens.cache?.read,
         cacheWriteTokens: assistant.tokens.cache?.write,
       } : undefined;

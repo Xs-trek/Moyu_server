@@ -278,6 +278,7 @@ async function testParser(): Promise<void> {
   const tc = find(evs, 'turn.completed');
   check(tc?.usage?.inputTokens === 100 && tc?.usage?.outputTokens === 50 && tc?.usage?.cacheReadTokens === 80, '[text+tool] turn.completed usage mapped');
   check(tc?.usage?.cacheWriteTokens === 10, '[text+tool] turn.completed cacheWriteTokens mapped (VM-verified field cache_write_input_tokens)');
+  check(tc?.usage?.reasoningTokens === 7, '[text+tool] turn.completed explicit reasoning tokens mapped');
   console.log('      [text+tool] event seq:', evs.map((e) => e.type).join(','));
 
   // tool-failed

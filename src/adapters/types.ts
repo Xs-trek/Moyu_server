@@ -25,6 +25,9 @@ export interface Usage {
   outputTokens?: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
+  /** Provider/runtime-reported reasoning tokens. Undefined means the native runtime did not
+   * expose a trustworthy value; common code never estimates this from other token fields. */
+  reasoningTokens?: number;
 }
 
 /** Locally observed turn timing. This never comes from, or returns to, the provider. The
@@ -32,6 +35,12 @@ export interface Usage {
  * queueing, CLI startup, provider latency, tool execution and approval waits. */
 export interface TurnPerformance {
   observedDurationMs: number;
+  /** Accepted input -> first non-empty assistant text observed by Moyu. */
+  timeToFirstOutputMs?: number;
+  /** First non-empty assistant text -> terminal completion. */
+  outputDurationMs?: number;
+  /** Output tokens divided by outputDurationMs. Never inferred from the full turn duration. */
+  outputTokensPerSecond?: number;
 }
 
 export interface ArtifactRef {
