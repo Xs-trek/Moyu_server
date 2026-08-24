@@ -25,6 +25,8 @@ import { SessionManager } from './session/manager';
 import { HookRegistry } from './api/hooks';
 import { createClaudeAdapter } from './adapters/claude/adapter';
 import { createCodexAdapter } from './adapters/codex/adapter';
+import { createOpencodeAdapter } from './adapters/opencode/adapter';
+import { createNativeHistoryProvider } from './history/native';
 import { NetProbe } from './net/probe';
 import { createInboundPolicy } from './net/types';
 import { EasyTierController } from './net/easytier';
@@ -109,26 +111,31 @@ async function main(options: RunOptions = {}): Promise<void> {
   const artifacts = new ArtifactStore();
   const sessions = new SessionManager(adapters, artifacts);
   const accounts = new AccountService();
+  let ctx!: ServerContext;
 
-  // §4: register only claude + codex by default. opencode is retained as interface code but
-  // registered ONLY behind an explicit experiment flag (MOYU_EXPERIMENT_OPENCODE=1) via a
-  // dynamic import, so it is not loaded into the running process unless explicitly opted in.
   adapters.register(
-    createClaudeAdapter({ port, approvalTimeoutSec: config.approvalTimeoutSec, hooks, adapterConfig: config.adapters.claude }),
+    createClaudeAdapter({
+      port,
+      approvalTimeoutSec: config.approvalTimeoutSec,
+      hooks,
+      adapterConfig: config.adapters.claude,
+      history: createNativeHistoryProvider('claude', () => ctx?.config ?? config, accounts),
+    }),
   );
-  adapters.register(createCodexAdapter({ port, hooks, approvalTimeoutSec: config.approvalTimeoutSec, adapterConfig: config.adapters.codex }));
-  if (process.env.MOYU_EXPERIMENT_OPENCODE === '1') {
-    const { createOpencodeAdapter } = await import('./adapters/opencode/adapter');
-    adapters.register(
-      createOpencodeAdapter({
-        approvalTimeoutSec: config.approvalTimeoutSec,
-        password: process.env.OPENCODE_SERVER_PASSWORD,
-      }),
-    );
-    log.warn('opencode adapter registered (experiment flag MOYU_EXPERIMENT_OPENCODE=1)', {});
-  }
-  // §4: defaultAdapter must be an enabled (registered) kind. A stale config carrying
-  // opencode/pty is coerced back to claude so the runtime never selects a disabled backend.
+  adapters.register(createCodexAdapter({
+    port,
+    hooks,
+    approvalTimeoutSec: config.approvalTimeoutSec,
+    adapterConfig: config.adapters.codex,
+    history: createNativeHistoryProvider('codex', () => ctx?.config ?? config, accounts),
+  }));
+  adapters.register(createOpencodeAdapter({
+    approvalTimeoutSec: config.approvalTimeoutSec,
+    adapterConfig: config.adapters.opencode,
+    password: process.env.OPENCODE_SERVER_PASSWORD ?? config.adapters.opencode.serverPassword,
+    username: process.env.OPENCODE_SERVER_USERNAME,
+  }));
+  // A stale v0.0.3 config may still contain pty/another removed experiment as default.
   if (!adapters.get(config.defaultAdapter)) {
     log.warn('defaultAdapter not enabled; coercing to claude', { was: config.defaultAdapter });
     config.defaultAdapter = 'claude';
@@ -150,7 +157,6 @@ async function main(options: RunOptions = {}): Promise<void> {
   // operator triggers /api/v1/pair/start; holds the transient pairing overlay + code.
   // Reads LIVE config via the getter: applyPatch reassigns ctx.config at runtime, so a
   // captured reference would go stale if the operator PATCHed config before pairing.
-  let ctx: ServerContext;
   const pairing = new PairingService(() => ctx.config, port);
   let server: Awaited<ReturnType<typeof startServer>> | undefined;
   let shuttingDown = false;
@@ -172,6 +178,11 @@ async function main(options: RunOptions = {}): Promise<void> {
       await sessions.disposeAll();
     } catch (e) {
       log.warn('session disposal error', { err: String(e) });
+    }
+    try {
+      await adapters.disposeAll();
+    } catch (e) {
+      log.warn('adapter disposal error', { err: String(e) });
     }
     try {
       artifacts.dispose();

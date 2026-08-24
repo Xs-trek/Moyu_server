@@ -319,6 +319,7 @@ export function buildClaudePrintInvocation(
 export class ClaudeSession implements SessionHandle {
   readonly sessionId: string;
   readonly cliSessionRef: string;
+  get resumeRef(): string { return this.cliSessionRef; }
   get model(): string | undefined { return this.opts.model; }
   get effort(): ReasoningEffort | undefined { return this.opts.effort; }
   get permissionMode(): PermissionMode { return this.opts.permissionMode; }

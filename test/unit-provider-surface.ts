@@ -12,6 +12,7 @@ import {
   buildClaudeSpawnEnv,
 } from '../src/adapters/claude/session';
 import { buildCodexExecInvocation, buildCodexSpawnEnv } from '../src/adapters/codex/protocol';
+import { buildOpenCodePrompt, parseOpenCodeModel } from '../src/adapters/opencode/client';
 import { resolveSessionWorkingDirectory } from '../src/session/manager';
 
 let pass = 0;
@@ -92,6 +93,18 @@ try {
   if (previousCompiled === undefined) delete runtimeGlobal.__MOYU_COMPILED__;
   else runtimeGlobal.__MOYU_COMPILED__ = previousCompiled;
 }
+
+const openCodeModel = parseOpenCodeModel('anthropic/claude-sonnet-4-5');
+const baselineOpenCode = buildOpenCodePrompt({ text: 'hello' }, openCodeModel);
+const decoratedOpenCode = buildOpenCodePrompt(
+  { text: 'hello', ...frontendMetadata } as { text: string },
+  openCodeModel,
+);
+check('OpenCode official prompt body is invariant to frontend metadata',
+  JSON.stringify(decoratedOpenCode) === JSON.stringify(baselineOpenCode));
+check('OpenCode official prompt body contains no frontend/product marker', !hasForbidden(baselineOpenCode));
+check('OpenCode model mapping uses explicit provider/model fields only',
+  JSON.stringify(baselineOpenCode.model) === JSON.stringify({ providerID: 'anthropic', modelID: 'claude-sonnet-4-5' }));
 
 const imageDir = mkdtempSync(join(tmpdir(), '.tmp-'));
 try {

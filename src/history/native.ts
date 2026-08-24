@@ -3,20 +3,19 @@
 import { open, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { AccountService } from '../accounts/service';
-import type { Message } from '../adapters/types';
+import type {
+  AdapterHistoryItem,
+  AdapterHistoryProvider,
+  AdapterHistoryRecord,
+  Message,
+} from '../adapters/types';
 import { effectiveConfigDir, resolveEffectiveModel } from '../adapters/effective-model';
 import type { AppConfig } from '../config/schema';
 
 export type NativeHistoryKind = 'claude' | 'codex';
 
-export interface NativeSessionItem {
-  nativeSessionId: string;
+export interface NativeSessionItem extends AdapterHistoryItem {
   kind: NativeHistoryKind;
-  title: string;
-  cwd?: string;
-  model?: string;
-  updatedAt: string;
-  messageCount: number;
   resumable: true;
 }
 
@@ -497,6 +496,7 @@ async function parseListCandidate(
       selection.kind === 'codex' ? codexTitlesById.get(ref.id) : undefined,
     );
     return {
+      resumeRef: ref.id,
       nativeSessionId: ref.id,
       kind: selection.kind,
       title: parsed.title || `${selection.kind} ${ref.id.slice(0, 8)}`,
@@ -563,6 +563,7 @@ export async function readNativeSession(
     selection,
     messages: parsed.messages,
     item: {
+      resumeRef: id,
       nativeSessionId: id,
       kind,
       title: parsed.title || `${kind} ${id.slice(0, 8)}`,
@@ -571,6 +572,56 @@ export async function readNativeSession(
       updatedAt: new Date(ref.mtimeMs).toISOString(),
       messageCount: parsed.messages.length,
       resumable: true,
+    },
+  };
+}
+
+/** Adapter-local view over the established read-only JSONL parser. Keeping the parser in this
+ * module preserves the v0.0.3 native-file behavior while moving discovery/read/resume ownership
+ * behind the public Adapter contract. */
+export function createNativeHistoryProvider(
+  kind: NativeHistoryKind,
+  getConfig: () => AppConfig,
+  accounts: AccountService,
+): AdapterHistoryProvider {
+  return {
+    async list(limit, offset = 0) {
+      const selection = resolveNativeSelection(kind, getConfig(), accounts);
+      const refs = await discoverFiles(selection);
+      const titles = kind === 'codex' ? await codexTitles(selection.configDir) : new Map<string, string>();
+      const items: NativeSessionItem[] = [];
+      let cursor = Math.min(offset, refs.length);
+      while (cursor < refs.length && items.length < limit) {
+        const item = await parseListCandidate({ selection, ref: refs[cursor++]! }, titles);
+        if (item) items.push(item);
+      }
+      let hasMore = false;
+      while (cursor < refs.length) {
+        if (await parseListCandidate({ selection, ref: refs[cursor++]! }, titles)) {
+          hasMore = true;
+          break;
+        }
+      }
+      return {
+        items,
+        nextOffset: cursor,
+        hasMore,
+        generatedAt: new Date().toISOString(),
+      };
+    },
+    async read(resumeRef): Promise<AdapterHistoryRecord | null> {
+      const record = await readNativeSession(kind, resumeRef, getConfig(), accounts);
+      if (!record) return null;
+      return {
+        item: record.item,
+        messages: record.messages,
+        resume: {
+          cwd: record.item.cwd,
+          profileId: record.selection.profileId,
+          profileEnv: record.selection.profileEnv,
+          displayModel: record.item.model,
+        },
+      };
     },
   };
 }

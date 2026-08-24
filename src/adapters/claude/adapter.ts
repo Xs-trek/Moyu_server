@@ -1,7 +1,7 @@
 // Claude adapter (A1). Subprocess `claude -p --output-format stream-json` + local command hook.
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { Adapter, AuthProfile, SessionHandle, SessionOpts } from '../types';
+import type { Adapter, AdapterHistoryProvider, AuthProfile, SessionHandle, SessionOpts } from '../types';
 import type { AdapterConfig } from '../../config/schema';
 import { probeVersion, which } from '../../util/spawn';
 import { isWindows } from '../../util/platform';
@@ -32,20 +32,26 @@ export interface ClaudeAdapterDeps {
   approvalTimeoutSec: number;
   hooks: HookRegistry;
   adapterConfig: AdapterConfig; // v3: approvalPolicy (hook behavior); activeProfileId resolved per-session
+  history?: AdapterHistoryProvider;
 }
 
 export class ClaudeAdapter implements Adapter {
   readonly kind = 'claude' as const;
   readonly displayName = 'Claude Code';
+  readonly history: AdapterHistoryProvider | undefined;
   readonly capabilities = {
     streaming: { text: true, thinking: true, tools: true },
     resume: true,
     interrupt: true,
     accountProfiles: true,
+    runtime: { source: 'native-cli' as const, shared: false },
+    history: { list: true, messages: true, resume: true },
+    attachments: { images: true, maxCount: 4 },
     approval: {
       transport: 'command-hook' as const,
       semantics: 'remote-every-tool-or-never' as const,
       policies: ['untrusted', 'on-failure', 'on-request', 'never'] as const,
+      choices: ['allow', 'allow_session', 'deny', 'cancel'] as const,
     },
     configuration: {
       model: true,
@@ -57,7 +63,17 @@ export class ClaudeAdapter implements Adapter {
     },
   };
 
-  constructor(private deps: ClaudeAdapterDeps) {}
+  constructor(private deps: ClaudeAdapterDeps) {
+    this.history = deps.history;
+  }
+
+  async compatibility() {
+    const bin = this.deps.adapterConfig.bin ?? resolveClaudeBinary() ?? 'claude';
+    const result = await probeVersion(bin);
+    return result.ok
+      ? { state: 'compatible' as const, protocol: 'claude-stream-json', version: result.version }
+      : { state: 'unavailable' as const, protocol: 'claude-stream-json', reason: 'Claude Code CLI is unavailable' };
+  }
 
   async isAvailable(): Promise<boolean> {
     const bin = this.deps.adapterConfig.bin;
@@ -78,7 +94,7 @@ export class ClaudeAdapter implements Adapter {
     const isolateProfileAuthEnv = Object.keys(opts.profileEnv ?? {}).length > 0;
     const session = new ClaudeSession({
       sessionId: opts.sessionId,
-      cliSessionRef: opts.cliSessionRef ?? opts.sessionId,
+      cliSessionRef: opts.resumeRef ?? opts.cliSessionRef ?? opts.sessionId,
       cwd: opts.cwd,
       extraDirs: opts.extraDirs,
       port: this.deps.port,

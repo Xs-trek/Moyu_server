@@ -150,6 +150,12 @@ function makeNativeDefault(adapter: SwitchableAdapter, cfg?: AppConfig): Account
 }
 
 export class AccountService {
+  /** Adapter-owned account/profile capability. Common REST code delegates here and never
+   * branches on platform names. */
+  supports(adapter: string): adapter is SwitchableAdapter {
+    return adapter === 'claude' || adapter === 'codex';
+  }
+
   /** Create only moyu-owned profile folders. Native CLI auth/config remains untouched. */
   ensureProfileLayout(): { root: string; claude: string; codex: string } {
     const root = profilesDir();

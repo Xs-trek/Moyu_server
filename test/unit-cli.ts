@@ -7,11 +7,15 @@ function check(name: string, condition: boolean): void {
   if (!condition) failed++;
 }
 
-check('v0.0.3 version source', VERSION === '0.0.3');
+check('v0.0.4 version source', VERSION === '0.0.4');
 check('moyu -help accepted', parseArgs(['-help']).kind === 'help');
 check('help documents Claude multi-OAuth configuration',
   HELP.includes('CLAUDE_CODE_OAUTH_TOKEN=...') &&
   HELP.includes('CLAUDE_CONFIG_DIR=<pre-logged-in OAuth config dir>'));
+check('help documents one-time shared OpenCode Server setup',
+  HELP.includes('stable PC-local Basic-auth credential')
+  && HELP.includes('add that local Server URL in OpenCode Desktop once')
+  && HELP.includes('private random-credential sidecar is never scraped'));
 check('moyu --help accepted', parseArgs(['--help']).kind === 'help');
 check('moyu -h accepted', parseArgs(['-h']).kind === 'help');
 check('moyu -init accepted', parseArgs(['-init']).kind === 'init');

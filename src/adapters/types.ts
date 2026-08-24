@@ -77,6 +77,10 @@ export type ApprovalDecision = ApprovalChoice | { allowWithModification: { answe
 
 export interface SessionOpts {
   sessionId: string; // backend-internal id
+  /** Opaque adapter-owned reference supplied only by the trusted history/resume route. */
+  resumeRef?: string;
+  /** v0.0.3 internal compatibility alias. New public callers must use resumeRef through the
+   * history provider rather than accepting this field from the phone. */
   cliSessionRef?: string; // claude --session-id / codex threadId / opencode session id (resume)
   cwd?: string;
   extraDirs?: string[];
@@ -100,6 +104,8 @@ export interface UserInput {
 
 export interface Message {
   seq: number; // global incrementing per session (I2 incremental history)
+  /** Stable upstream id used to reconcile events from shared runtimes such as OpenCode. */
+  sourceId?: string;
   role: 'user' | 'assistant' | 'tool' | 'system';
   text?: string;
   toolCallId?: string;
@@ -113,6 +119,9 @@ export interface Message {
 
 export type AdapterEvent =
   | { type: 'turn.started' }
+  /** Idempotent full-message projection for shared runtimes where another client may create or
+   * update history. SessionManager merges by message.sourceId and advances its local seq. */
+  | { type: 'message.upsert'; message: Omit<Message, 'seq'> }
   | { type: 'thinking.delta'; text: string }
   | { type: 'thinking.done' }
   | { type: 'text.delta'; text: string }
@@ -141,8 +150,58 @@ export type AdapterEvent =
   | { type: 'turn.failed'; category: FailureCategory; summary: string; permissionMode?: PermissionMode }
   | { type: 'transport.metrics'; metrics: TransportMetrics };
 
+export interface AdapterHistoryItem {
+  /** Adapter-owned opaque reference. It is never assumed to be a UUID by common code. */
+  resumeRef: string;
+  /** v0.0.3 response alias retained for one compatibility release. */
+  nativeSessionId: string;
+  kind: AdapterKind;
+  title: string;
+  cwd?: string;
+  model?: string;
+  updatedAt: string;
+  messageCount: number;
+  resumable: boolean;
+}
+
+export interface AdapterHistoryRecord {
+  item: AdapterHistoryItem;
+  messages: Message[];
+  /** Private resume context. Only the backend consumes these fields. */
+  resume: {
+    cwd?: string;
+    profileId?: string;
+    profileEnv?: Record<string, string>;
+    displayModel?: string;
+  };
+}
+
+export interface AdapterHistoryPage {
+  items: AdapterHistoryItem[];
+  nextOffset: number;
+  hasMore: boolean;
+  generatedAt: string;
+  /** Sources that could not be read. Other adapters remain available. */
+  partialFailures?: AdapterKind[];
+}
+
+export interface AdapterHistoryProvider {
+  list(limit: number, offset?: number): Promise<AdapterHistoryPage>;
+  read(resumeRef: string): Promise<AdapterHistoryRecord | null>;
+}
+
+export interface AdapterCompatibility {
+  state: 'compatible' | 'incompatible' | 'unavailable' | 'unknown';
+  protocol: string;
+  version?: string;
+  reason?: string;
+}
+
 export interface SessionHandle {
   readonly sessionId: string;
+  /** A real adapter-owned resume reference, once one exists. */
+  readonly resumeRef?: string;
+  /** v0.0.3 compatibility alias. */
   readonly cliSessionRef?: string;
   /** Resolved explicit values. Undefined means the CLI's native default remains authoritative. */
   readonly model?: string;
@@ -171,10 +230,24 @@ export interface AdapterCapabilities {
   resume: boolean;
   interrupt: boolean;
   accountProfiles: boolean;
+  runtime: {
+    source: 'native-cli' | 'local-server';
+    shared: boolean;
+  };
+  history: {
+    list: boolean;
+    messages: boolean;
+    resume: boolean;
+  };
+  attachments: {
+    images: boolean;
+    maxCount: number;
+  };
   approval: {
     transport: 'http-hook' | 'command-hook' | 'native';
     semantics: 'remote-every-tool-or-never' | 'native';
     policies: readonly ApprovalPolicy[];
+    choices: readonly ApprovalChoice[];
   };
   configuration: {
     model: boolean;
@@ -191,10 +264,14 @@ export interface Adapter {
   readonly kind: AdapterKind;
   readonly displayName: string;
   readonly capabilities: AdapterCapabilities;
+  readonly history?: AdapterHistoryProvider;
+  compatibility?(): Promise<AdapterCompatibility>;
   isAvailable(): Promise<boolean>; // CLI installed?
   detect(): Promise<AuthProfile>; // 0-modify: read-only
   startSession(opts: SessionOpts): Promise<SessionHandle>;
   /** Apply live config after a /config PATCH. Adapters capture approvalTimeoutSec + adapterConfig
    *  at construction; without this, post-PATCH sessions spawn with stale config (review P1). */
   reconfigure?(opts: { approvalTimeoutSec: number; adapterConfig: AdapterConfig }): void;
+  /** Adapter-global cleanup (for example a Moyu-owned shared OpenCode server). */
+  dispose?(): Promise<void>;
 }

@@ -1,7 +1,7 @@
 // Unit tests for validateConfigPatch (review P2): applyPatch trusted the JSON shape, so a
 // string approvalTimeoutSec -> NaN or a bad enum could persist into runtime config. This gates a
 // 400 before any mutation. Run: npx tsx test/unit-config-patch.ts
-import { validateConfigPatch, ENABLED_ADAPTER_KINDS } from '../src/config/schema';
+import { sanitizeConfig, validateConfigPatch, ENABLED_ADAPTER_KINDS } from '../src/config/schema';
 import { applyPatch, loadConfig } from '../src/config/loader';
 import { writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -27,9 +27,10 @@ check('valid boundary approvalTimeoutSec=10', validateConfigPatch({ approvalTime
 check('valid boundary approvalTimeoutSec=590', validateConfigPatch({ approvalTimeoutSec: 590 }).length === 0);
 check('valid logLevel', validateConfigPatch({ logLevel: 'debug' }).length === 0);
 check('valid defaultAdapter', validateConfigPatch({ defaultAdapter: 'codex' }).length === 0);
-check('§4 defaultAdapter opencode rejected (not enabled)', validateConfigPatch({ defaultAdapter: 'opencode' }).length > 0);
+check('v0.0.4 defaultAdapter opencode accepted', validateConfigPatch({ defaultAdapter: 'opencode' }).length === 0);
 check('§4 defaultAdapter pty rejected (not enabled)', validateConfigPatch({ defaultAdapter: 'pty' }).length > 0);
-check('§4 ENABLED_ADAPTER_KINDS = claude+codex only', ENABLED_ADAPTER_KINDS.length === 2 && ENABLED_ADAPTER_KINDS.includes('claude') && ENABLED_ADAPTER_KINDS.includes('codex') && !ENABLED_ADAPTER_KINDS.includes('opencode') && !ENABLED_ADAPTER_KINDS.includes('pty'));
+check('v0.0.4 enabled adapters = claude+codex+opencode', ENABLED_ADAPTER_KINDS.length === 3 && ENABLED_ADAPTER_KINDS.includes('claude') && ENABLED_ADAPTER_KINDS.includes('codex') && ENABLED_ADAPTER_KINDS.includes('opencode') && !ENABLED_ADAPTER_KINDS.includes('pty' as never));
+check('valid OpenCode model patch', validateConfigPatch({ adapters: { opencode: { model: 'anthropic/claude-sonnet-4-5' } } }).length === 0);
 check('valid adapter approvalPolicy', validateConfigPatch({ adapters: { claude: { approvalPolicy: 'never' } } }).length === 0);
 check('valid adapter sandbox', validateConfigPatch({ adapters: { codex: { sandbox: 'danger-full-access' } } }).length === 0);
 check('valid gateway range', validateConfigPatch({ gateway: { portMin: 18080, portMax: 18099 } }).length === 0);
@@ -68,6 +69,10 @@ check('non-object adapters invalid', validateConfigPatch({ adapters: 'x' }).leng
   try {
     const base = loadConfig(tmp); // §2: forces privateMode true + persists to tmp
     base.adapters.claude.configDir = 'C:\\local-only-claude';
+    base.adapters.opencode.serverMode = 'attach';
+    base.adapters.opencode.serverUrl = 'http://127.0.0.1:4096';
+    base.adapters.opencode.serverUsername = 'pc-local-user';
+    base.adapters.opencode.serverPassword = 'pc-local-secret-must-not-cross';
     check('loadConfig forces privateMode true from disk false (§2)', base.network.privateMode === true);
     check('loadConfig forces gateway bindHost to loopback', base.gateway.bindHost === '127.0.0.1');
     // applyPatch must NOT let a PATCH disable privateMode (stays true); other fields still apply.
@@ -78,6 +83,11 @@ check('non-object adapters invalid', validateConfigPatch({ adapters: 'x' }).leng
     check('applyPatch ignores privateMode:false (stays true, §2)', attacked.network.privateMode === true);
     check('applyPatch still applies publicNode alongside', attacked.network.publicNode === 'tcp://1.2.3.4:11010');
     check('applyPatch cannot change PC-local adapter configDir', attacked.adapters.claude.configDir === 'C:\\local-only-claude');
+    const sanitized = JSON.stringify(sanitizeConfig(attacked));
+    check('GET /config projection omits PC-local OpenCode server settings',
+      !sanitized.includes('serverMode') && !sanitized.includes('serverUrl')
+      && !sanitized.includes('serverUsername') && !sanitized.includes('pc-local-user')
+      && !sanitized.includes('serverPassword') && !sanitized.includes('pc-local-secret-must-not-cross'));
   } finally {
     try { rmSync(tmp, { force: true }); } catch { /* temp */ }
   }

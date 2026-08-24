@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
-import type { AppConfig, ConfigPatch } from './schema';
+import type { AdapterConfig, AppConfig, ConfigPatch } from './schema';
 import { DEFAULT_ADAPTER_CONFIG } from './schema';
 import { log } from '../util/logger';
 import { ensurePrivateDirectory, securePrivateFile, writeFileInPrivateDirectory, writePrivateFile } from '../util/private-file';
@@ -56,6 +56,12 @@ const DEFAULTS: AppConfig = {
   adapters: {
     claude: { ...DEFAULT_ADAPTER_CONFIG },
     codex: { ...DEFAULT_ADAPTER_CONFIG },
+    opencode: {
+      ...DEFAULT_ADAPTER_CONFIG,
+      serverMode: 'managed',
+      serverUrl: 'http://127.0.0.1:4096',
+      serverUsername: 'opencode',
+    },
   },
 };
 
@@ -134,6 +140,13 @@ export function loadConfig(path?: string, opts: { generate?: boolean } = {}): Ap
       cfg.network.networkName = 'rd-' + randomBytes(4).toString('hex');
       dirty = true;
     }
+    // A stable PC-local credential lets OpenCode Desktop/TUI and Moyu attach to the same
+    // managed loopback Server after one setup. It is not a provider credential and is omitted
+    // from every phone-facing projection/patch surface.
+    if (!cfg.adapters.opencode.serverPassword) {
+      cfg.adapters.opencode.serverPassword = randomBytes(32).toString('base64url');
+      dirty = true;
+    }
     // Preserve the established public configuration bound. The command relay owns its own
     // timeout and Claude's command-hook timeout is only a later backstop.
     if (cfg.approvalTimeoutSec > 590) {
@@ -172,6 +185,7 @@ export function applyPatch(cfg: AppConfig, patch: ConfigPatch): AppConfig {
   const net = patch.network ?? {};
   const cla = patch.adapters?.claude ?? {};
   const cod = patch.adapters?.codex ?? {};
+  const opc = patch.adapters?.opencode ?? {};
   const next: AppConfig = {
     ...cfg,
     gateway: {
@@ -201,6 +215,7 @@ export function applyPatch(cfg: AppConfig, patch: ConfigPatch): AppConfig {
     adapters: {
       claude: pickAdapter(cfg.adapters.claude, cla),
       codex: pickAdapter(cfg.adapters.codex, cod),
+      opencode: pickAdapter(cfg.adapters.opencode, opc),
     },
   };
   saveConfig(next);
@@ -209,9 +224,9 @@ export function applyPatch(cfg: AppConfig, patch: ConfigPatch): AppConfig {
 
 /** Copy only allowlisted adapter fields; never bin (RCE vector). */
 function pickAdapter(
-  base: AppConfig['adapters']['claude'],
-  p: NonNullable<NonNullable<ConfigPatch['adapters']>['claude']>,
-): AppConfig['adapters']['claude'] {
+  base: AppConfig['adapters'][keyof AppConfig['adapters']],
+  p: Partial<AdapterConfig>,
+): AdapterConfig {
   return {
     ...base,
     ...(p.approvalPolicy !== undefined ? { approvalPolicy: p.approvalPolicy } : {}),

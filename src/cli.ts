@@ -16,6 +16,9 @@ import { loadConfig, saveConfig, configPath as getConfigPath } from './config/lo
 import { sanitizeConfig } from './config/schema';
 import { createClaudeAdapter } from './adapters/claude/adapter';
 import { createCodexAdapter } from './adapters/codex/adapter';
+import { OpenCodeClient } from './adapters/opencode/client';
+import { resolveOpenCodeBinary, supportedOpenCodeVersion } from './adapters/opencode/runtime';
+import { detectOpenCodeDesktop } from './adapters/opencode/desktop';
 import { HookRegistry } from './api/hooks';
 import { EasyTierController } from './net/easytier';
 import { materializeEmbeddedBin, selfCheckEmbeddedBin } from './net/embedded-bin';
@@ -28,6 +31,7 @@ import { existsSync } from 'node:fs';
 import { normalizeConfigPath } from './adapters/config-location';
 import { resolveClaudeConfigLocation } from './adapters/claude/auth';
 import { resolveCodexConfigLocation } from './adapters/codex/auth';
+import { probeVersion } from './util/spawn';
 
 export { VERSION };
 
@@ -52,7 +56,7 @@ export type CliAction =
   | { kind: 'start'; options: RunOptions }
   | { kind: 'daemon-run'; options: RunOptions };
 
-export const HELP = `moyu ${VERSION} - remote AI CLI control backend
+export const HELP = `moyu ${VERSION} - remote native AI runtime control backend
 
 Usage:
   moyu -init                 Configure relay, start in background, print a pairing string
@@ -73,7 +77,8 @@ Options:
   -log-level <level>         debug|info|warn|error
 
 First-time setup (one relay configuration):
-  1. Log in with each native CLI you use: claude / codex login.
+  1. Log in/configure Claude/Codex if used. OpenCode provider setup remains in OpenCode;
+     built-in free models do not require Moyu-side login or API-key configuration.
   2. Put moyu.exe's directory on PATH (or invoke it by absolute path).
   3. Run moyu -init and enter the EasyTier relay; the gateway starts hidden and
      prints a five-minute pairing string for the phone.
@@ -91,11 +96,16 @@ Multiple API/OAuth profiles (under <config-dir>/profiles):
                              PowerShell: $env:CODEX_HOME='<dir>'; codex login
                              Custom provider: configure model_provider/base_url/env_key in
                              config.toml, then append that env key as KEY=VALUE here.
-  OAuth and token exchange are always performed by the native CLI, never by moyu.
+  OAuth and token exchange are always performed by the native runtime, never by moyu.
 
-Native CLI config directories (auto-detected; confirm/override during -init):
+Claude/Codex configuration directories (auto-detected; confirm/override during -init):
   Claude: adapters.claude.configDir > CLAUDE_CONFIG_DIR > ~/.claude
   Codex:  adapters.codex.configDir  > CODEX_HOME        > ~/.codex
+  OpenCode: -init generates a stable PC-local Basic-auth credential. Managed mode starts one
+            official loopback opencode serve; attach uses adapters.opencode.serverUrl.
+            To share Desktop history, add that local Server URL in OpenCode Desktop once and
+            select it as default. Desktop's private random-credential sidecar is never scraped.
+            Provider setup remains owned by OpenCode; moyu never performs provider requests.
   These PC-local paths cannot be changed by the phone API.
 
 Config precedence: -config <path> > REMOTE_DASHBOARD_CONFIG >
@@ -217,8 +227,16 @@ export function parseArgs(argv: string[]): CliAction {
 interface DetectResult {
   claudeAvail: boolean;
   codexAvail: boolean;
+  opencodeAvail: boolean;
   claudeMode: string;
   codexMode: string;
+  opencodeMode: string;
+  opencodeServerMode: 'managed' | 'attach';
+  opencodeServerUrl: string;
+  opencodeVersion?: string;
+  opencodeReason?: string;
+  opencodeCliBin: string | null;
+  opencodeDesktopPath?: string;
   claudeConfigDir: string;
   claudeConfigSource: string;
   codexConfigDir: string;
@@ -255,14 +273,55 @@ async function detect(configPath?: string): Promise<DetectResult> {
     claude.detect(),
     codex.detect(),
   ]);
+  const opencodeServerMode = cfg.adapters.opencode.serverMode === 'attach' ? 'attach' : 'managed';
+  const opencodeServerUrl = cfg.adapters.opencode.serverUrl ?? 'http://127.0.0.1:4096';
+  const opencodeDesktop = detectOpenCodeDesktop();
+  const opencodePassword = process.env.OPENCODE_SERVER_PASSWORD
+    ?? cfg.adapters.opencode.serverPassword;
+  let opencodeAvail = false;
+  let opencodeVersion: string | undefined;
+  let opencodeReason: string | undefined;
+  let opencodeCliBin: string | null = null;
+  if (opencodeServerMode === 'attach') {
+    try {
+      const health = await new OpenCodeClient(
+        opencodeServerUrl,
+        cfg.adapters.opencode.serverUsername ?? process.env.OPENCODE_SERVER_USERNAME ?? 'opencode',
+        opencodePassword,
+      ).health();
+      opencodeVersion = health.version;
+      opencodeAvail = health.healthy && supportedOpenCodeVersion(health.version);
+      if (!opencodeAvail) opencodeReason = 'unsupported Server version';
+    } catch (error) {
+      opencodeAvail = false;
+      opencodeReason = error instanceof Error ? error.message : 'Server unavailable';
+    }
+  } else {
+    opencodeCliBin = resolveOpenCodeBinary(cfg.adapters.opencode.bin);
+    const version = opencodeCliBin ? await probeVersion(opencodeCliBin) : { ok: false as const };
+    opencodeVersion = version.version;
+    opencodeAvail = version.ok && supportedOpenCodeVersion(version.version);
+    if (!opencodeCliBin) opencodeReason = opencodeDesktop
+      ? 'Desktop found; install the official OpenCode CLI to host a stable shared Server'
+      : 'official OpenCode CLI not found';
+    else if (!opencodeAvail) opencodeReason = 'unsupported OpenCode CLI version';
+  }
   const easytierBin = new EasyTierController(cfg.network).getState().bin ?? null;
   const claudeLocation = resolveClaudeConfigLocation(cfg.adapters.claude.configDir);
   const codexLocation = resolveCodexConfigLocation(cfg.adapters.codex.configDir);
   return {
     claudeAvail,
     codexAvail,
+    opencodeAvail,
     claudeMode: claudeAuth.mode,
     codexMode: codexAuth.mode,
+    opencodeMode: 'server-api',
+    opencodeServerMode,
+    opencodeServerUrl,
+    opencodeVersion,
+    opencodeReason,
+    opencodeCliBin,
+    opencodeDesktopPath: opencodeDesktop?.path,
     claudeConfigDir: claudeLocation.path,
     claudeConfigSource: claudeLocation.source,
     codexConfigDir: codexLocation.path,
@@ -284,12 +343,17 @@ export async function runCheck(configPath?: string): Promise<number> {
     `  config:   ${d.claudeConfigDir} (${d.claudeConfigSource})`,
     `codex:      ${d.codexAvail ? 'OK' : 'NOT FOUND'} (${d.codexMode})`,
     `  config:   ${d.codexConfigDir} (${d.codexConfigSource})`,
+    `opencode:   ${d.opencodeAvail ? 'OK' : 'NOT READY'} (${d.opencodeMode}; ${d.opencodeServerMode}${d.opencodeVersion ? `; ${d.opencodeVersion}` : ''})`,
+    `  server:   ${d.opencodeServerUrl}`,
+    ...(d.opencodeCliBin ? [`  cli:      ${d.opencodeCliBin}`] : []),
+    ...(d.opencodeDesktopPath ? [`  desktop:  ${d.opencodeDesktopPath}`] : []),
+    ...(d.opencodeReason ? [`  note:     ${d.opencodeReason}`] : []),
     `easytier:   ${d.easytierBin ? 'OK ' + d.easytierBin : 'NOT FOUND (set network.easytierBin)'}`,
     `publicNode: ${d.publicNode ? 'OK ' + d.publicNode : 'NOT SET (remote access disabled)'}`,
   ];
   for (const l of lines) console.log(l);
   // Ready to start if a token exists and at least one AI CLI is available.
-  const ok = d.hasToken && (d.claudeAvail || d.codexAvail);
+  const ok = d.hasToken && (d.claudeAvail || d.codexAvail || d.opencodeAvail);
   return ok ? 0 : 1;
 }
 
@@ -338,17 +402,20 @@ export async function runInit(configPath?: string): Promise<number> {
   console.log(`moyu ${VERSION} first-time setup\n`);
 
   // [1] detect CLIs (read-only; never logs in)
-  console.log('[1/5] AI CLI detection');
+  console.log('[1/5] Native AI runtime detection');
   const d = await detect(configPath);
   console.log(`  claude: ${d.claudeAvail ? 'OK' : 'NOT FOUND'} (${d.claudeMode})`);
   console.log(`  codex:  ${d.codexAvail ? 'OK' : 'NOT FOUND'} (${d.codexMode})`);
-  if (!d.claudeAvail && !d.codexAvail) {
-    console.log('  ! no AI CLI detected. Install + run native login first (moyu does NOT do first login).');
+  console.log(`  opencode: ${d.opencodeAvail ? 'OK' : 'NOT READY'} (${d.opencodeMode}; ${d.opencodeServerMode} ${d.opencodeServerUrl}${d.opencodeVersion ? `; ${d.opencodeVersion}` : ''})`);
+  if (d.opencodeDesktopPath) console.log(`    Desktop: ${d.opencodeDesktopPath}`);
+  if (d.opencodeReason) console.log(`    note: ${d.opencodeReason}`);
+  if (!d.claudeAvail && !d.codexAvail && !d.opencodeAvail) {
+    console.log('  ! no AI runtime detected. Install/configure a native runtime first (moyu does NOT perform first login).');
   }
 
   // [2] confirm adapter configuration roots. Enter accepts the discovered directory; an
   // environment-derived directory is persisted so later background starts need no shell setup.
-  console.log('\n[2/5] Native CLI configuration directories');
+  console.log('\n[2/5] Claude/Codex configuration directories');
   const rl = createInterface({ input: stdin, output: stdout });
   let enteredClaudeDir = '';
   let enteredCodexDir = '';
@@ -430,6 +497,15 @@ export async function runInit(configPath?: string): Promise<number> {
   console.log(`  profiles: ${profileLayout.root}`);
   console.log('  phone credentials: generated and stored locally (delivered by pairing)');
   console.log('  add Claude <name>.env or Codex <name>.home files only if you need multiple accounts');
+  if (d.opencodeCliBin && cfg.adapters.opencode.serverMode !== 'attach') {
+    console.log('  OpenCode shared Server (add once in Desktop -> Servers, then set as default):');
+    console.log(`    URL:      ${cfg.adapters.opencode.serverUrl ?? 'http://127.0.0.1:4096'}`);
+    console.log(`    username: ${cfg.adapters.opencode.serverUsername ?? 'opencode'}`);
+    console.log(`    password: ${cfg.adapters.opencode.serverPassword}`);
+  } else if (d.opencodeDesktopPath && !d.opencodeCliBin) {
+    console.log('  OpenCode Desktop detected, but its private sidecar cannot be safely attached.');
+    console.log('  Install the matching official OpenCode CLI, rerun `moyu -init`, then add the printed local Server in Desktop once.');
+  }
   console.log('\nInitialization saved. Starting the gateway in background...');
   return 0;
 }

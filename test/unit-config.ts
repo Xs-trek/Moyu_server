@@ -24,6 +24,8 @@ const checks: [string, boolean][] = [
   ['sanitize has activeProfileId field (claude)', 'activeProfileId' in s.adapters.claude],
   ['sanitize activeProfileId undefined when unset', s.adapters.claude.activeProfileId === undefined],
   ['sanitize codex present', s.adapters.codex.approvalPolicy === 'untrusted'],
+  ['OpenCode shared-server password generated', typeof cfg.adapters.opencode.serverPassword === 'string' && cfg.adapters.opencode.serverPassword.length >= 32],
+  ['sanitize omits OpenCode server password', !JSON.stringify(s).includes(cfg.adapters.opencode.serverPassword!)],
   ['PC daemon control token generated', typeof cfg.controlToken === 'string' && cfg.controlToken.length >= 32],
   ['sanitize omits PC daemon control token', !('controlToken' in s)],
 ];
@@ -34,6 +36,7 @@ const patched = sanitizeConfig({
   adapters: {
     claude: { ...cfg.adapters.claude, activeProfileId: 'claude:env:thirdparty' },
     codex: cfg.adapters.codex,
+    opencode: cfg.adapters.opencode,
   },
 });
 checks.push(['PATCH activeProfileId reflected', patched.adapters.claude.activeProfileId === 'claude:env:thirdparty']);

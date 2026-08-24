@@ -139,6 +139,41 @@ check('backfill includes assistant msg', backfill.some((m) => m.role === 'assist
 // (seq not strictly greater) and the streamed output was lost on reconnect.
 check('backfill excludes the user msg already seen', backfill.every((m) => m.role !== 'user'));
 
+// Canonical upserts from a shared server must replace optimistic/local projections and remain
+// idempotent across SSE replay or REST reconciliation.
+emit({
+  type: 'message.upsert',
+  message: { sourceId: 'shared:user:1', role: 'user', text: 'list files', createdAt: '2026-08-24T00:00:00.000Z' },
+});
+check('canonical user upsert replaces the optimistic accepted-input row',
+  mgr.history(sid).filter((message) => message.role === 'user' && message.text === 'list files').length === 1
+    && mgr.history(sid).some((message) => message.sourceId === 'shared:user:1'));
+emit({
+  type: 'message.upsert',
+  message: { sourceId: 'shared:assistant:1', role: 'assistant', text: 'draft', createdAt: '2026-08-24T00:00:01.000Z' },
+});
+emit({
+  type: 'message.upsert',
+  message: { sourceId: 'shared:assistant:1', role: 'assistant', text: 'final', createdAt: '2026-08-24T00:00:02.000Z' },
+});
+check('replayed sourceId updates one canonical message instead of duplicating it',
+  mgr.history(sid).filter((message) => message.sourceId === 'shared:assistant:1').length === 1
+    && mgr.history(sid).some((message) => message.sourceId === 'shared:assistant:1' && message.text === 'final'));
+emit({
+  type: 'message.upsert',
+  message: {
+    sourceId: 'shared:tool:1',
+    role: 'tool',
+    toolCallId: 't1',
+    tool: 'Bash',
+    toolOutput: 'file1\nfile2\n',
+    createdAt: '2026-08-24T00:00:03.000Z',
+  },
+});
+check('canonical tool upsert replaces its optimistic streaming tool row',
+  mgr.history(sid).filter((message) => message.toolCallId === 't1').length === 1
+    && mgr.history(sid).some((message) => message.sourceId === 'shared:tool:1'));
+
 // BOUND (review P2: messages[] + toolOutput grew unbounded). toolOutput over 256KB truncates.
 emit({ type: 'tool.start', toolCallId: 't2', tool: 'Bash', input: { command: 'big' } });
 emit({ type: 'tool.output', toolCallId: 't2', text: 'x'.repeat(300_000) });

@@ -2,11 +2,21 @@
 
 本项目记录 remote-dashboard（moyu）的版本演进。日期为本地时区。
 
+## [0.0.4] - 2026-08-24 — 多运行时聚合与 OpenCode Server
+
+- 增加基于官方 OpenCode Server REST/SSE 的适配器，支持单一共享连接、managed/attach 生命周期、历史读取/恢复、权限、终止和多客户端事件补偿。
+- Claude Code、Codex 与 OpenCode 统一到 capability 驱动的 Session/Message/Event/History/Resume/Interrupt 契约，公共 REST、WebSocket 与 SessionManager 不按平台分支。
+- 使用稳定上游 `sourceId` 合并 REST/SSE 重叠、断线重放以及外部 OpenCode 客户端写入，避免消息和工具卡片重复。
+- OpenCode 仅允许 PC loopback HTTP，限制响应和 SSE frame，禁用重定向；Server URL、用户名、密码与可执行文件路径均不允许由手机修改或读取。
+- `moyu -init` 为 managed OpenCode Server 自动生成并私存稳定 Basic Auth，检测 Desktop 但不抓取其随机 sidecar 口令；Desktop 可一次性连接同一官方 Server，共享会话与数据库。
+- OpenCode 兼容门限定为经 fixture 与真实隔离冒烟验证的 1.17.9–1.18.x；内置 free 模型不再被 provider key 检测错误阻塞。
+- 协议仍为 version 1；后端、Web UI 与 Android 版本统一为 0.0.4，Android `versionCode 4`。
+
 ## [0.0.3] - 2026-08-20 — 配对与移动端一致性定版
 
 - `moyu -init` 在后台网关就绪后立即创建并打印五分钟一次性配对字符串；`moyu -pair` 继续承担显式重新生成。
 - 初始化、帮助、Android 集成说明和验收契约使用同一配对流程，不再要求用户猜测第二条命令。
-- 与 v0.0.3 Android/WebView UI 对齐版本；OpenCode CLI 与手机独立 Chat 不进入本版范围。
+- 与 v0.0.3 Android/WebView UI 对齐版本；手机独立 Chat 不进入本版范围。
 - Claude 会话仅公开 Plan / Auto / Accept Edits，并支持空闲时手动切换模式与模型；Auto 明确不受支持时只降级状态，不自动重发内容。
 - 请求模型与本轮实际模型分层，修复兼容 Base URL 回报模型名覆盖用户选择的问题。
 - 审批与失败不再写入重复 system 消息；Android 清理旧副本，前端默认折叠非正文运行记录。

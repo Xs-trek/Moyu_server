@@ -1,5 +1,5 @@
 // Codex adapter (A2/#1). Streaming `codex exec --json` subprocess + PreToolUse command hook.
-import type { Adapter, AuthProfile, SessionHandle, SessionOpts } from '../types';
+import type { Adapter, AdapterHistoryProvider, AuthProfile, SessionHandle, SessionOpts } from '../types';
 import type { AdapterConfig } from '../../config/schema';
 import type { HookRegistry } from '../../api/hooks';
 import { existsSync } from 'node:fs';
@@ -49,20 +49,26 @@ export interface CodexAdapterDeps {
   port: number;
   /** #1: HookRegistry to register the per-session PreToolUse handler. */
   hooks: HookRegistry;
+  history?: AdapterHistoryProvider;
 }
 
 export class CodexAdapter implements Adapter {
   readonly kind = 'codex' as const;
   readonly displayName = 'Codex';
+  readonly history: AdapterHistoryProvider | undefined;
   readonly capabilities = {
     streaming: { text: true, thinking: true, tools: true },
     resume: true,
     interrupt: true,
     accountProfiles: true,
+    runtime: { source: 'native-cli' as const, shared: false },
+    history: { list: true, messages: true, resume: true },
+    attachments: { images: true, maxCount: 4 },
     approval: {
       transport: 'command-hook' as const,
       semantics: 'remote-every-tool-or-never' as const,
       policies: ['untrusted', 'on-failure', 'on-request', 'never'] as const,
+      choices: ['allow', 'allow_session', 'deny', 'cancel'] as const,
     },
     configuration: {
       model: true,
@@ -75,7 +81,19 @@ export class CodexAdapter implements Adapter {
   };
   private compatibleBin: string | null = null;
 
-  constructor(private deps: CodexAdapterDeps) {}
+  constructor(private deps: CodexAdapterDeps) {
+    this.history = deps.history;
+  }
+
+  async compatibility() {
+    const bin = resolveCodexBinary(this.deps.adapterConfig.bin);
+    if (!bin) return { state: 'unavailable' as const, protocol: 'codex-exec-jsonl', reason: 'Codex CLI is unavailable' };
+    const result = await probeVersion(bin);
+    if (!result.ok) return { state: 'unavailable' as const, protocol: 'codex-exec-jsonl', reason: 'Codex CLI version probe failed' };
+    return isSupportedCodexVersion(result.version)
+      ? { state: 'compatible' as const, protocol: 'codex-exec-jsonl', version: result.version }
+      : { state: 'incompatible' as const, protocol: 'codex-exec-jsonl', version: result.version, reason: 'Moyu v0.0.4 requires Codex CLI 0.146.x' };
+  }
 
   private async checkCompatible(bin: string): Promise<boolean> {
     if (this.compatibleBin === bin) return true;
@@ -110,7 +128,7 @@ export class CodexAdapter implements Adapter {
     }
     const session = new CodexSession({
       sessionId: opts.sessionId,
-      cliSessionRef: opts.cliSessionRef ?? opts.sessionId,
+      cliSessionRef: opts.resumeRef ?? opts.cliSessionRef ?? opts.sessionId,
       cwd: opts.cwd,
       extraDirs: opts.extraDirs,
       port: this.deps.port,

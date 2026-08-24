@@ -4,7 +4,6 @@ import type { ServerContext } from '../context';
 import { applyPatch } from '../config/loader';
 import { sanitizeConfig, validateConfigPatch } from '../config/schema';
 import type { AdapterKind, ConfigPatch } from '../config/schema';
-import type { SwitchableAdapter } from '../accounts/service';
 import type { PermissionMode, ReasoningEffort } from '../adapters/types';
 import { listDir } from '../fs/service';
 import { diffRepo } from '../vcs/git';
@@ -12,25 +11,16 @@ import { log, setLogLevel, safeFailure } from '../util/logger';
 import { getPlatform, getArch } from '../util/platform';
 import { readJsonBody, readJsonObject, sendJson, parseQuery } from './http';
 import { MAX_INPUT_TEXT_CHARS } from './ws';
+import { VERSION } from '../version';
 import { createInboundPolicy } from '../net/types';
 import { verifyToken } from '../gateway/auth';
 import { resolveCliDefaultModel, resolveEffectiveModel } from '../adapters/effective-model';
 import { readArtifactBody, sendArtifact } from '../artifacts/http';
 import { toClientFailure } from './failure';
-import {
-  listNativeSessions,
-  MAX_NATIVE_LIST_OFFSET,
-  pageNativeMessages,
-  readNativeSession,
-  type NativeHistoryKind,
-} from '../history/native';
+import { MAX_NATIVE_LIST_OFFSET } from '../history/native';
 
 function notFound(res: ServerResponse, path: string): void {
   sendJson(res, 404, { error: 'not found', path });
-}
-
-function isSwitchable(kind: string): kind is SwitchableAdapter {
-  return kind === 'claude' || kind === 'codex';
 }
 
 export async function handleRest(
@@ -70,10 +60,11 @@ export async function handleRest(
 
   if (path === '/api/v1/server/info' && method === 'GET') {
     const adapters = (await ctx.adapters.refreshStatus()).map((status) => {
-      if (!isSwitchable(status.kind)) return status;
       // Local presentation metadata only. This reads the selected profile's existing CLI files
       // and environment; it never starts the CLI and never probes an AI provider.
-      const profileEnv = ctx.accounts.resolveActiveEnv(status.kind, ctx.config);
+      const profileEnv = ctx.accounts.supports(status.kind)
+        ? ctx.accounts.resolveActiveEnv(status.kind, ctx.config)
+        : undefined;
       const cliDefaultModel = resolveCliDefaultModel(status.kind, ctx.config, profileEnv);
       const effectiveModel = resolveEffectiveModel(status.kind, ctx.config, profileEnv);
       const modelOverride = ctx.config.adapters[status.kind].model?.trim() || undefined;
@@ -85,6 +76,20 @@ export async function handleRest(
       };
     });
     sendJson(res, 200, {
+      version: VERSION,
+      protocolVersion: 1,
+      maxMessageBytes: MAX_INPUT_TEXT_CHARS,
+      features: {
+        diff: true,
+        resume: true,
+        eventGapSync: true,
+        sessionEffort: true,
+        sessionModel: true,
+        sessionPermissionMode: true,
+        interrupt: true,
+        approvals: true,
+        artifacts: true,
+      },
       platform: getPlatform(),
       arch: getArch(),
       port: ctx.port,
@@ -130,7 +135,7 @@ export async function handleRest(
     return;
   }
 
-  if (path === '/api/v1/native-sessions' && method === 'GET') {
+  if ((path === '/api/v1/history' || path === '/api/v1/native-sessions') && method === 'GET') {
     const rawLimit = q.limit === undefined ? 50 : Number(q.limit);
     const rawOffset = q.offset === undefined ? 0 : Number(q.offset);
     if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 100) {
@@ -142,15 +147,15 @@ export async function handleRest(
       return;
     }
     try {
-      sendJson(res, 200, await listNativeSessions(ctx.config, ctx.accounts, rawLimit, rawOffset));
+      sendJson(res, 200, await ctx.adapters.listHistory(rawLimit, rawOffset));
     } catch (error) {
       sendJson(res, 400, { error: safeFailure(error).summary });
     }
     return;
   }
 
-  let native = new RegExp(`^/api/v1/native-sessions/(claude|codex)/([0-9a-fA-F-]{36})/messages$`).exec(path);
-  if (native && method === 'GET') {
+  let history = /^\/api\/v1\/(?:history|native-sessions)\/([^/]+)\/([^/]+)\/messages$/.exec(path);
+  if (history && method === 'GET') {
     const after = q.after === undefined ? 0 : Number(q.after);
     const limit = q.limit === undefined ? 100 : Number(q.limit);
     if (!Number.isInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
@@ -159,33 +164,47 @@ export async function handleRest(
     }
     let record;
     try {
-      record = await readNativeSession(native[1] as NativeHistoryKind, native[2]!, ctx.config, ctx.accounts);
+      const kind = decodeURIComponent(history[1]!);
+      const resumeRef = decodeURIComponent(history[2]!);
+      if (!ctx.adapters.has(kind) || resumeRef.length > 512) return notFound(res, path);
+      record = await ctx.adapters.readHistory(kind, resumeRef);
     } catch (error) {
       sendJson(res, 400, { error: safeFailure(error).summary });
       return;
     }
     if (!record) return notFound(res, path);
-    sendJson(res, 200, pageNativeMessages(record, after, limit));
+    const matching = record.messages.filter((message) => message.seq > after);
+    const items = matching.slice(0, limit);
+    sendJson(res, 200, {
+      items,
+      latestSeq: record.messages.at(-1)?.seq ?? 0,
+      hasMore: matching.length > items.length,
+      nextAfter: items.at(-1)?.seq ?? after,
+      generatedAt: new Date().toISOString(),
+    });
     return;
   }
 
-  native = new RegExp(`^/api/v1/native-sessions/(claude|codex)/([0-9a-fA-F-]{36})/resume$`).exec(path);
-  if (native && method === 'POST') {
+  history = /^\/api\/v1\/(?:history|native-sessions)\/([^/]+)\/([^/]+)\/resume$/.exec(path);
+  if (history && method === 'POST') {
     let record;
     try {
-      record = await readNativeSession(native[1] as NativeHistoryKind, native[2]!, ctx.config, ctx.accounts);
+      const kind = decodeURIComponent(history[1]!);
+      const resumeRef = decodeURIComponent(history[2]!);
+      if (!ctx.adapters.has(kind) || resumeRef.length > 512) return notFound(res, path);
+      record = await ctx.adapters.readHistory(kind, resumeRef);
     } catch (error) {
       sendJson(res, 400, { error: safeFailure(error).summary });
       return;
     }
     if (!record) return notFound(res, path);
     const sessionId = await ctx.sessions.create(record.item.kind, {
-      cliSessionRef: record.item.nativeSessionId,
-      cwd: record.item.cwd,
+      resumeRef: record.item.resumeRef,
+      cwd: record.resume.cwd,
       title: record.item.title,
-      profileId: record.selection.profileId,
-      profileEnv: record.selection.profileEnv,
-      displayModel: record.item.model,
+      profileId: record.resume.profileId,
+      profileEnv: record.resume.profileEnv,
+      displayModel: record.resume.displayModel,
       seedMessages: record.messages,
     });
     sendJson(res, 201, { sessionId, session: ctx.sessions.summary(sessionId) });
@@ -218,7 +237,7 @@ export async function handleRest(
     // v3: resolve the active profile's env (subscription switching) for switchable adapters.
     // Claude injects profile env; Codex injects the selected CODEX_HOME path. Resolved live.
     const stringLimits: Array<[string, number]> = [
-      ['profileId', 256], ['model', 128], ['effort', 16], ['permissionMode', 16], ['title', 256], ['cwd', 4096], ['cliSessionRef', 512],
+      ['profileId', 256], ['model', 128], ['effort', 16], ['permissionMode', 16], ['title', 256], ['cwd', 4096],
     ];
     for (const [field, limit] of stringLimits) {
       const value = body[field];
@@ -233,12 +252,15 @@ export async function handleRest(
     const permissionMode = body.permissionMode as PermissionMode | undefined;
     const title = body.title as string | undefined;
     const cwd = body.cwd as string | undefined;
-    const cliSessionRef = body.cliSessionRef as string | undefined;
+    if (body.cliSessionRef !== undefined || body.resumeRef !== undefined) {
+      sendJson(res, 400, { error: 'resume references are accepted only by the history resume endpoint' });
+      return;
+    }
     let profileEnv: Record<string, string> | undefined;
     let profileId: string | undefined;
     let displayModel: string | undefined;
     try {
-      if (isSwitchable(body.kind)) {
+      if (ctx.accounts.supports(body.kind)) {
         const profile = ctx.accounts.selectedProfile(body.kind, profileIdRequested, ctx.config);
         profileId = profile.id;
         profileEnv = ctx.accounts.resolveEnv(profile);
@@ -257,7 +279,6 @@ export async function handleRest(
     const sessionId = await ctx.sessions.create(body.kind as never, {
       cwd,
       title,
-      cliSessionRef,
       profileEnv,
       profileId,
       model,
@@ -575,8 +596,8 @@ export async function handleRest(
   if (path === '/api/v1/accounts/activate' && method === 'POST') {
     const body = await readJsonObject(req);
     if (typeof body.adapter !== 'string' || typeof body.profileId !== 'string' ||
-        !body.profileId || !isSwitchable(body.adapter)) {
-      sendJson(res, 400, { error: 'adapter (claude|codex) and profileId required' });
+        !body.profileId || !ctx.accounts.supports(body.adapter)) {
+      sendJson(res, 400, { error: 'profile-capable adapter and profileId required' });
       return;
     }
     try {

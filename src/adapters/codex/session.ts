@@ -93,6 +93,9 @@ export class CodexSession implements SessionHandle {
   /** Once Codex reports its native thread id, publish that authoritative id in summaries so
    * native-history discovery can reconcile the live session instead of showing a second card. */
   get cliSessionRef(): string { return this.threadId ?? this.initialCliSessionRef; }
+  get resumeRef(): string | undefined {
+    return this.threadId ?? (this.initialCliSessionRef !== this.sessionId ? this.initialCliSessionRef : undefined);
+  }
   get model(): string | undefined { return this.opts.model; }
   get effort(): ReasoningEffort | undefined { return this.opts.effort; }
   private emit: (event: AdapterEvent) => void = () => {};

@@ -4,10 +4,13 @@
 // degradation when publicNode is absent (C5: not-configured, no throw).
 // Run: npx tsx test/smoke-easytier.ts
 import { execSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { EasyTierController } from '../src/net/easytier';
 import type { NetworkConfig } from '../src/config/schema';
 
-const BIN = process.env.EASYTIER_BIN ?? 'D:/CC/remote_dashboard/bin/win-x64/easytier-core.exe';
+const BIN = process.env.EASYTIER_BIN
+  ?? resolve(dirname(fileURLToPath(import.meta.url)), '../bin/win-x64/easytier-core.exe');
 const PUB = 'tcp://47.109.138.211:11010';
 
 let pass = 0;

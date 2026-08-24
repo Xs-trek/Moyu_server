@@ -41,7 +41,7 @@ export const EGRESS_ALLOWED_OUTBOUND_FILES = [
   'src/net/probe.ts', // NetProbe: TCP reachability to the configured relay public node
   'src/cli.ts', // CLI client: HTTP to the local gateway (localhost)
   'src/approval/hook-relay.ts', // Codex hook relay: fixed localhost gateway endpoint only
-  'src/adapters/opencode/session.ts', // opencode adapter (SHELVED): HTTP to the local opencode server
+  'src/adapters/opencode/client.ts', // official OpenCode Server API bridge; target is runtime-gated to loopback
 ] as const;
 
 /** Extract the host from a URL or host[:port] string, lower-cased. */

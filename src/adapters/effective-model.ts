@@ -135,7 +135,7 @@ export function resolveEffectiveModel(
       explicitModel: explicitModel ?? config.adapters.codex.model,
     });
   }
-  return explicitModel;
+  return modelId(explicitModel) ?? modelId(config.adapters.opencode.model);
 }
 
 /** Resolve only the profile-local CLI default, deliberately ignoring the persisted Moyu model

@@ -94,6 +94,7 @@ export interface SessionSummary {
   updatedAt: string;
   cwd: string;
   cliSessionRef?: string;
+  resumeRef?: string;
   profileId?: string;
   model?: string;
   requestedModel?: string;
@@ -106,6 +107,9 @@ export interface SessionSummary {
 
 export interface CreateSessionOpts {
   cwd?: string;
+  /** Trusted adapter history reference. Never populated directly from POST /sessions. */
+  resumeRef?: string;
+  /** Internal v0.0.3 compatibility alias used only by existing tests/callers. */
   cliSessionRef?: string;
   title?: string;
   extraDirs?: string[];
@@ -189,6 +193,17 @@ function boundAdapterEvent(event: AdapterEvent): AdapterEvent {
       return { ...event, text: capEventText(event.text), base64: capEventText(event.base64) };
     case 'approval.request':
       return { ...event, summary: capEventText(event.summary)!, input: boundUnknown(event.input) };
+    case 'message.upsert':
+      return {
+        ...event,
+        message: {
+          ...event.message,
+          text: capEventText(event.message.text),
+          thinking: capEventText(event.message.thinking),
+          toolInput: event.message.toolInput === undefined ? undefined : boundUnknown(event.message.toolInput),
+          toolOutput: capEventText(event.message.toolOutput),
+        },
+      };
     case 'turn.failed':
       return { ...event, summary: capEventText(event.summary)! };
     default:
@@ -215,7 +230,8 @@ export class SessionManager {
     const cwd = resolveSessionWorkingDirectory(opts.cwd);
     const handle = await this.adapters.startSession(kind, {
       sessionId,
-      cliSessionRef: opts.cliSessionRef ?? sessionId,
+      resumeRef: opts.resumeRef ?? opts.cliSessionRef,
+      cliSessionRef: opts.resumeRef ?? opts.cliSessionRef ?? sessionId,
       cwd,
       extraDirs: opts.extraDirs,
       profileEnv: opts.profileEnv,
@@ -386,6 +402,43 @@ export class SessionManager {
 
   private persist(r: SessionRecord, ev: AdapterEvent): void {
     switch (ev.type) {
+      case 'message.upsert': {
+        const sourceId = ev.message.sourceId;
+        if (!sourceId) break;
+        let existingIndex = r.messages.findIndex((message) => message.sourceId === sourceId);
+        // OpenCode prompt_async assigns the native message id server-side. Reconcile the later
+        // authoritative user event with SessionManager's optimistic accepted-input row instead
+        // of persisting the same prompt twice.
+        if (existingIndex < 0 && ev.message.role === 'user') {
+          for (let index = r.messages.length - 1; index >= 0; index--) {
+            const candidate = r.messages[index]!;
+            if (!candidate.sourceId && candidate.role === 'user' && candidate.text === ev.message.text) {
+              existingIndex = index;
+              break;
+            }
+          }
+        }
+        // Streaming tool.start/tool.output events create an optimistic local tool row before
+        // OpenCode publishes its stable message/part ids. Replace that row when the canonical
+        // upsert arrives so shared Desktop/Moyu event streams do not duplicate one tool call.
+        if (existingIndex < 0 && ev.message.role === 'tool' && ev.message.toolCallId) {
+          for (let index = r.messages.length - 1; index >= 0; index--) {
+            const candidate = r.messages[index]!;
+            if (!candidate.sourceId && candidate.role === 'tool'
+              && candidate.toolCallId === ev.message.toolCallId) {
+              existingIndex = index;
+              break;
+            }
+          }
+        }
+        if (existingIndex >= 0) r.messages.splice(existingIndex, 1);
+        r.messages.push({ ...ev.message, seq: r.seq });
+        this.enforceMessageBounds(r);
+        if (!r.title && ev.message.role === 'user' && ev.message.text?.trim()) {
+          r.title = ev.message.text.trim().slice(0, 60);
+        }
+        break;
+      }
       case 'text.done':
         this.msg(r, { role: 'assistant', text: ev.text });
         if (!r.title) r.title = ev.text.slice(0, 60);
@@ -434,6 +487,7 @@ export class SessionManager {
       updatedAt: r.updatedAt,
       cwd: r.cwd,
       cliSessionRef: r.handle.cliSessionRef,
+      resumeRef: r.handle.resumeRef,
       profileId: r.profileId,
       model: r.model,
       requestedModel: r.requestedModel,

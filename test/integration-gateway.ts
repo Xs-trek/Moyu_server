@@ -23,12 +23,14 @@ import type { ServerContext } from '../src/context';
 import type {
   Adapter,
   AdapterEvent,
+  AdapterHistoryProvider,
   ApprovalDecision,
   AuthProfile,
   ReasoningEffort,
   SessionHandle,
   SessionOpts,
 } from '../src/adapters/types';
+import { createNativeHistoryProvider } from '../src/history/native';
 import { createInboundPolicy, type NetStatus } from '../src/net/types';
 import { ArtifactStore } from '../src/artifacts/store';
 
@@ -105,7 +107,7 @@ class MockAdapter implements Adapter {
   readonly kind: 'claude' | 'codex';
   readonly displayName: string;
   readonly capabilities: Adapter['capabilities'];
-  constructor(kind: 'claude' | 'codex', displayName: string) {
+  constructor(kind: 'claude' | 'codex', displayName: string, readonly history?: AdapterHistoryProvider) {
     this.kind = kind;
     this.displayName = displayName;
     this.capabilities = {
@@ -222,13 +224,13 @@ async function main(): Promise<void> {
   } as AppConfig;
 
   const port = await findFreePort(19000, 19099, '127.0.0.1');
+  const accounts = new AccountService();
   const adapters = new AdapterManager();
-  adapters.register(new MockAdapter('claude', 'claude (mock)'));
-  adapters.register(new MockAdapter('codex', 'codex (mock)'));
+  adapters.register(new MockAdapter('claude', 'claude (mock)', createNativeHistoryProvider('claude', () => config, accounts)));
+  adapters.register(new MockAdapter('codex', 'codex (mock)', createNativeHistoryProvider('codex', () => config, accounts)));
   const artifacts = new ArtifactStore();
   const sessions = new SessionManager(adapters, artifacts);
   const hooks = new HookRegistry();
-  const accounts = new AccountService();
   const mockNetStatus: NetStatus = {
     profile: { ipv6GuaAvailable: false, inboundFirewallDefault: 'unknown', natType: 'unknown', clash: null },
     publicNode: null,

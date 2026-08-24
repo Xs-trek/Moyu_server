@@ -1,330 +1,441 @@
-// Opencode session (A3): `opencode serve` HTTP + SSE. v1/v2 coexist; detected at
-// runtime via /openapi.json. Verified findings §3; items marked // SMOKE need VM
-// validation (v1/v2 branch, reply body fields, SSE paths).
-import { spawn, type ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import type {
   AdapterEvent,
   ApprovalDecision,
   ApprovalKind,
   Message,
   SessionHandle,
-  UserInput,
   Usage,
+  UserInput,
 } from '../types';
 import { ApprovalTracker, toOpencode } from '../../approval/bridge';
-import { which } from '../../util/spawn';
-import { findFreePort } from '../../gateway/ports';
-import { log, registerSecrets, registerEnvSecrets, categorizeError, safeStderrSummary } from '../../util/logger';
-import { scrubMoyuEnv } from '../../util/runtime';
+import { categorizeError, log, safeStderrSummary, type SafeFailure } from '../../util/logger';
+import {
+  parseOpenCodeModel,
+  type OpenCodeGlobalEvent,
+  type OpenCodeMessageInfo,
+  type OpenCodeMessageRecord,
+  type OpenCodePart,
+} from './client';
+import type { OpenCodeServerRuntime } from './runtime';
 
-export interface OpencodeSessionOpts {
+const MAX_HISTORY_MESSAGES = 5_000;
+const NOOP = (_event: AdapterEvent): void => {};
+
+export interface OpenCodeSessionOpts {
   sessionId: string;
-  cliSessionRef: string;
-  cwd?: string;
+  resumeRef?: string;
+  cwd: string;
+  title?: string;
   approvalTimeoutSec: number;
-  password?: string; // OPENCODE_SERVER_PASSWORD if set
   model?: string;
 }
 
-function authHeaders(password?: string): Record<string, string> {
-  if (!password) return {};
-  return { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}` };
+function iso(value: unknown): string {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? new Date(value).toISOString()
+    : new Date().toISOString();
 }
 
-const CHOICES = ['allow', 'allow_session', 'deny', 'cancel'] as const;
+function upstreamErrorText(error: unknown): string {
+  if (error && typeof error === 'object') {
+    const value = error as Record<string, unknown>;
+    const data = value.data as Record<string, unknown> | undefined;
+    if (data && typeof data.message === 'string') return data.message;
+    if (typeof value.message === 'string') return value.message;
+    if (typeof value.name === 'string') return value.name;
+  }
+  return 'OpenCode turn failed';
+}
 
-export class OpencodeSession implements SessionHandle {
+/** Convert an upstream failure to a stable phone-safe vocabulary. The original text is used
+ * only for local redacted diagnostics and category selection; it is never placed in an event. */
+function clientSafeError(error: unknown): SafeFailure {
+  const raw = upstreamErrorText(error);
+  const category = categorizeError(raw);
+  log.warn('OpenCode upstream turn failure', { category, summary: safeStderrSummary(raw) });
+  const summaries: Record<SafeFailure['category'], string> = {
+    auth: 'OpenCode authentication failed',
+    'rate-limit': 'OpenCode request was rate limited',
+    network: 'OpenCode connection failed',
+    'not-found': 'OpenCode resource is unavailable',
+    parse: 'OpenCode protocol response was invalid',
+    unknown: 'OpenCode turn failed',
+  };
+  return { category, summary: summaries[category] };
+}
+
+function contentMessage(record: OpenCodeMessageRecord): Omit<Message, 'seq'> | null {
+  const text = record.parts
+    .filter((part) => part.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text!)
+    .join('');
+  const thinking = record.parts
+    .filter((part) => part.type === 'reasoning' && typeof part.text === 'string')
+    .map((part) => part.text!)
+    .join('');
+  if (!text && !thinking) return null;
+  return {
+    sourceId: `opencode:${record.info.id}`,
+    role: record.info.role,
+    ...(text ? { text } : {}),
+    ...(thinking ? { thinking } : {}),
+    createdAt: iso(record.info.time?.created),
+  };
+}
+
+function toolMessage(info: OpenCodeMessageInfo, part: OpenCodePart): Omit<Message, 'seq'> | null {
+  if (part.type !== 'tool' || !part.callID) return null;
+  const state = part.state ?? {};
+  const output = typeof state.output === 'string' ? state.output
+    : typeof state.error === 'string' ? state.error : undefined;
+  return {
+    sourceId: `opencode:${info.id}:tool:${part.callID}`,
+    role: 'tool',
+    toolCallId: part.callID,
+    tool: part.tool ?? 'tool',
+    toolInput: state.input ?? {},
+    ...(output !== undefined ? { toolOutput: output } : {}),
+    createdAt: iso(info.time?.created),
+  };
+}
+
+export function normalizeOpenCodeMessages(records: readonly OpenCodeMessageRecord[]): Message[] {
+  const messages: Array<Omit<Message, 'seq'>> = [];
+  for (const record of records) {
+    const content = contentMessage(record);
+    if (content) messages.push(content);
+    for (const part of record.parts) {
+      const tool = toolMessage(record.info, part);
+      if (tool) messages.push(tool);
+    }
+  }
+  return messages.slice(-MAX_HISTORY_MESSAGES).map((message, index) => ({ ...message, seq: index + 1 }));
+}
+
+function eventProperties(event: OpenCodeGlobalEvent): Record<string, unknown> {
+  return event.payload.properties ?? {};
+}
+
+function permissionKind(type: unknown): ApprovalKind {
+  const value = String(type ?? '').toLowerCase();
+  if (/edit|write|patch/.test(value)) return 'fileChange';
+  if (/bash|shell|command|exec/.test(value)) return 'command';
+  return 'permission';
+}
+
+export class OpenCodeSession implements SessionHandle {
   readonly sessionId: string;
-  readonly cliSessionRef: string;
-  private emit: (e: AdapterEvent) => void = () => {};
-  private child: ChildProcess | null = null;
-  private tracker: ApprovalTracker;
-  private base = '';
-  private version: 'v1' | 'v2' = 'v2';
-  private ocSessionId: string | null = null;
-  private sseCtrl: AbortController | null = null;
-  // Accumulated assistant text from session.next.text.delta / message.part.updated. Flushed
-  // as a text.done event at every message boundary so SessionManager persists it (it only
-  // persists on text.done; without this opencode assistant replies never reach /messages).
-  private messageBuf = '';
-  /** §5: accumulated serve stderr; never logged raw -- only a fixed-length redacted summary. */
-  private stderrBuf = '';
+  private nativeSessionId = '';
+  get resumeRef(): string | undefined { return this.nativeSessionId || undefined; }
+  get cliSessionRef(): string | undefined { return this.resumeRef; }
+  get model(): string | undefined { return this.modelValue; }
 
-  constructor(private opts: OpencodeSessionOpts) {
+  private modelValue?: string;
+  private emit: (event: AdapterEvent) => void = NOOP;
+  private buffered: AdapterEvent[] = [];
+  private unsubscribeRuntime: (() => void) | null = null;
+  private tracker: ApprovalTracker;
+  private pendingApprovals = new Set<string>();
+  private infos = new Map<string, OpenCodeMessageInfo>();
+  private parts = new Map<string, Map<string, OpenCodePart>>();
+  private toolStates = new Map<string, { status?: string; output?: string }>();
+  private turnRunning = false;
+  private moyuPending = false;
+  private disposed = false;
+  private completing: Promise<void> | null = null;
+  private latestAssistant?: OpenCodeMessageInfo;
+
+  constructor(private runtime: OpenCodeServerRuntime, private opts: OpenCodeSessionOpts) {
     this.sessionId = opts.sessionId;
-    this.cliSessionRef = opts.cliSessionRef;
-    this.tracker = new ApprovalTracker(opts.approvalTimeoutSec, (id, decision) => {
-      this.emit({ type: 'approval.resolved', approvalId: id, decision });
+    this.modelValue = opts.model;
+    this.tracker = new ApprovalTracker(opts.approvalTimeoutSec, (approvalId, decision, timedOut) => {
+      this.pendingApprovals.delete(approvalId);
+      if (timedOut && this.nativeSessionId) {
+        void this.runtime.client()
+          .then((client) => client.replyPermission(this.nativeSessionId, approvalId, 'reject', this.opts.cwd))
+          .catch(() => {});
+      }
+      this.emitEvent({ type: 'approval.resolved', approvalId, decision });
     });
   }
 
   async init(): Promise<void> {
-    const bin = which('opencode');
-    if (!bin) throw new Error('opencode CLI not found');
-    const port = await findFreePort(14000, 14099, '127.0.0.1');
-    this.base = `http://127.0.0.1:${port}`;
-    this.child = spawn(bin, ['serve', '--port', String(port), '--hostname', '127.0.0.1'], {
-      cwd: this.opts.cwd,
-      env: scrubMoyuEnv(process.env, undefined, this.opts.cwd),
-      windowsHide: true,
-    });
-    // §5: opencode runs in the user's native env. Register credential-bearing process.env
-    // values + the opencode auth password so arbitrary-format tokens are masked in stderr.
-    registerEnvSecrets(process.env);
-    if (this.opts.password) registerSecrets(this.opts.password);
-    this.child.stderr?.on('data', (d: Buffer) => {
-      // §5: never log raw stderr per-chunk. Accumulate; emit one redacted summary on close.
-      this.stderrBuf += d.toString('utf8');
-    });
-    this.child.on('close', (code) => {
-      // §5: never log raw stderr; only exit code + error category + fixed-length redacted summary.
-      if (this.stderrBuf.trim()) {
-        log.warn('opencode serve stderr summary', {
-          code,
-          category: categorizeError(this.stderrBuf),
-          summary: safeStderrSummary(this.stderrBuf),
-        });
-      } else {
-        log.info('opencode serve exited', { code });
+    const client = await this.runtime.client();
+    parseOpenCodeModel(this.modelValue);
+    if (this.opts.resumeRef) {
+      if (this.opts.resumeRef.length > 512 || !/^[A-Za-z0-9._:-]+$/.test(this.opts.resumeRef)) {
+        throw new Error('invalid OpenCode resume reference');
       }
-      this.child = null;
+      const session = await client.getSession(this.opts.resumeRef, this.opts.cwd);
+      if (!session?.id || session.id !== this.opts.resumeRef) throw new Error('OpenCode session not found');
+      this.nativeSessionId = session.id;
+      if (session.directory) this.opts.cwd = session.directory;
+    } else {
+      const session = await client.createSession(this.opts.cwd, this.opts.title);
+      if (!session?.id) throw new Error('OpenCode create session returned no id');
+      this.nativeSessionId = session.id;
+      if (session.directory) this.opts.cwd = session.directory;
+    }
+    this.runtime.rememberSession(this.nativeSessionId, this.opts.cwd);
+    this.unsubscribeRuntime = this.runtime.subscribe(this.nativeSessionId, {
+      directory: this.opts.cwd,
+      onEvent: (event) => this.onOpenCodeEvent(event),
+      onReconnect: () => {
+        void this.reconcile().catch((error) => this.failTurnIfRunning(error));
+      },
     });
-
-    await this.waitReady();
-    this.version = await this.detectVersion();
-    log.info('opencode ready', { version: this.version, base: this.base });
-    this.ocSessionId = await this.createSession();
-    this.startSSE();
+    await this.reconcile();
   }
 
-  private async waitReady(): Promise<void> {
-    const deadline = Date.now() + 15000;
-    while (Date.now() < deadline) {
+  private emitEvent(event: AdapterEvent): void {
+    if (this.disposed) return;
+    if (this.emit === NOOP) {
+      if (this.buffered.length < 256) this.buffered.push(event);
+      return;
+    }
+    this.emit(event);
+  }
+
+  private cachePart(part: OpenCodePart): void {
+    let parts = this.parts.get(part.messageID);
+    if (!parts) this.parts.set(part.messageID, parts = new Map());
+    parts.set(part.id, part);
+  }
+
+  private emitCachedMessage(messageId: string): void {
+    const info = this.infos.get(messageId);
+    if (!info) return;
+    const record: OpenCodeMessageRecord = { info, parts: [...(this.parts.get(messageId)?.values() ?? [])] };
+    const content = contentMessage(record);
+    if (content) this.emitEvent({ type: 'message.upsert', message: content });
+    for (const part of record.parts) {
+      const tool = toolMessage(info, part);
+      if (tool) this.emitEvent({ type: 'message.upsert', message: tool });
+    }
+  }
+
+  private ensureTurnStarted(): void {
+    if (this.turnRunning) return;
+    this.turnRunning = true;
+    this.emitEvent({ type: 'turn.started' });
+  }
+
+  private onOpenCodeEvent(event: OpenCodeGlobalEvent): void {
+    const type = event.payload.type;
+    const properties = eventProperties(event);
+    if (type === 'message.updated') {
+      const info = properties.info as unknown as OpenCodeMessageInfo | undefined;
+      if (!info?.id || info.sessionID !== this.nativeSessionId) return;
+      this.infos.set(info.id, info);
+      if (info.role === 'assistant') {
+        this.latestAssistant = info;
+        this.ensureTurnStarted();
+      }
+      this.emitCachedMessage(info.id);
+      if (info.error) {
+        this.failTurn(info.error);
+      }
+      return;
+    }
+    if (type === 'message.part.updated') {
+      const part = properties.part as unknown as OpenCodePart | undefined;
+      if (!part?.id || part.sessionID !== this.nativeSessionId) return;
+      this.cachePart(part);
+      const info = this.infos.get(part.messageID);
+      if (info?.role === 'assistant') {
+        this.ensureTurnStarted();
+        const delta = typeof properties.delta === 'string' ? properties.delta : undefined;
+        if (delta && part.type === 'text') this.emitEvent({ type: 'text.delta', text: delta });
+        if (delta && part.type === 'reasoning') this.emitEvent({ type: 'thinking.delta', text: delta });
+      }
+      if (part.type === 'tool' && part.callID) this.emitToolPart(part);
+      this.emitCachedMessage(part.messageID);
+      return;
+    }
+    if (type === 'permission.updated') {
+      if (properties.sessionID !== this.nativeSessionId || typeof properties.id !== 'string') return;
+      const approvalId = properties.id;
+      if (this.tracker.has(approvalId)) return;
+      this.pendingApprovals.add(approvalId);
+      this.tracker.register(approvalId, () => {});
+      this.emitEvent({
+        type: 'approval.request',
+        approvalId,
+        kind: permissionKind(properties.type),
+        tool: typeof properties.type === 'string' ? properties.type : undefined,
+        input: properties.metadata ?? properties.pattern,
+        summary: typeof properties.title === 'string' ? properties.title : `OpenCode permission: ${String(properties.type ?? 'request')}`,
+        choices: ['allow', 'allow_session', 'deny', 'cancel'],
+      });
+      return;
+    }
+    if (type === 'permission.replied') {
+      if (properties.sessionID !== this.nativeSessionId || typeof properties.permissionID !== 'string') return;
+      const decision = properties.response === 'always' ? 'allow_session'
+        : properties.response === 'once' ? 'allow' : 'deny';
+      this.tracker.resolve(properties.permissionID, decision);
+      return;
+    }
+    if (type === 'session.status') {
+      if (properties.sessionID !== this.nativeSessionId) return;
+      const status = properties.status as Record<string, unknown> | undefined;
+      if (status?.type === 'busy') this.ensureTurnStarted();
+      if (status?.type === 'idle') this.scheduleCompleteTurn();
+      return;
+    }
+    if (type === 'session.idle') {
+      if (properties.sessionID === this.nativeSessionId) this.scheduleCompleteTurn();
+      return;
+    }
+    if (type === 'session.error') {
+      if (properties.sessionID !== this.nativeSessionId) return;
+      this.failTurn(properties.error);
+    }
+  }
+
+  private emitToolPart(part: OpenCodePart): void {
+    const callId = part.callID!;
+    const status = part.state?.status;
+    const output = typeof part.state?.output === 'string' ? part.state.output
+      : typeof part.state?.error === 'string' ? part.state.error : undefined;
+    const previous = this.toolStates.get(callId);
+    if (!previous && (status === 'pending' || status === 'running' || status === 'completed' || status === 'error')) {
+      this.emitEvent({ type: 'tool.start', toolCallId: callId, tool: part.tool ?? 'tool', input: part.state?.input ?? {} });
+    }
+    if (output !== undefined && output !== previous?.output) {
+      this.emitEvent({ type: 'tool.output', toolCallId: callId, text: output });
+    }
+    if ((status === 'completed' || status === 'error') && status !== previous?.status) {
+      this.emitEvent({ type: 'tool.done', toolCallId: callId, isError: status === 'error' });
+    }
+    this.toolStates.set(callId, { status, output });
+  }
+
+  private async completeTurn(): Promise<void> {
+    if (this.completing) return this.completing;
+    this.completing = (async () => {
       try {
-        const r = await fetch(`${this.base}/health`);
-        if (r.ok) return;
-      } catch {
-        // not up yet
+        await this.reconcile();
+      } catch (error) {
+        this.failTurn(error);
+        return;
       }
-      await new Promise((r) => setTimeout(r, 200));
+      if (!this.turnRunning && !this.moyuPending) return;
+      const assistant = this.latestAssistant;
+      const usage: Usage | undefined = assistant?.tokens ? {
+        inputTokens: assistant.tokens.input,
+        outputTokens: assistant.tokens.output,
+        cacheReadTokens: assistant.tokens.cache?.read,
+        cacheWriteTokens: assistant.tokens.cache?.write,
+      } : undefined;
+      const model = assistant?.providerID && assistant.modelID
+        ? `${assistant.providerID}/${assistant.modelID}` : this.modelValue;
+      this.emitEvent({ type: 'turn.completed', usage, costUsd: assistant?.cost, model });
+      this.turnRunning = false;
+      this.moyuPending = false;
+    })().finally(() => { this.completing = null; });
+    return this.completing;
+  }
+
+  private scheduleCompleteTurn(): void {
+    void this.completeTurn().catch((error) => this.failTurn(error));
+  }
+
+  private failTurnIfRunning(error: unknown): void {
+    if (this.turnRunning || this.moyuPending) this.failTurn(error);
+    else log.warn('OpenCode history reconciliation failed', { summary: safeStderrSummary(upstreamErrorText(error)) });
+  }
+
+  private failTurn(error: unknown): void {
+    if (!this.turnRunning && !this.moyuPending) return;
+    this.emitEvent({ type: 'turn.failed', ...clientSafeError(error) });
+    this.turnRunning = false;
+    this.moyuPending = false;
+  }
+
+  async reconcile(): Promise<void> {
+    if (!this.nativeSessionId || this.disposed) return;
+    const client = await this.runtime.client();
+    const records = await client.listMessages(this.nativeSessionId, this.opts.cwd);
+    for (const record of records) {
+      this.infos.set(record.info.id, record.info);
+      const parts = new Map<string, OpenCodePart>();
+      for (const part of record.parts) parts.set(part.id, part);
+      this.parts.set(record.info.id, parts);
+      if (record.info.role === 'assistant') this.latestAssistant = record.info;
     }
-    throw new Error('opencode serve did not become ready');
-  }
-
-  private async detectVersion(): Promise<'v1' | 'v2'> {
-    // SMOKE: /openapi.json vs /doc; presence of v2 routes
-    try {
-      const r = await fetch(`${this.base}/openapi.json`);
-      if (r.ok) {
-        const spec = (await r.json()) as { paths?: Record<string, unknown> };
-        if (spec.paths?.['/api/event'] || spec.paths?.['/api/session']) return 'v2';
-        return 'v1';
-      }
-    } catch {
-      // best-effort
+    for (const message of normalizeOpenCodeMessages(records)) {
+      const { seq: _seq, ...value } = message;
+      this.emitEvent({ type: 'message.upsert', message: value });
     }
-    return 'v2'; // default to v2 (dev source)
-  }
-
-  private async createSession(): Promise<string> {
-    // SMOKE: v1 POST /session vs v2 POST /api/session
-    const path = this.version === 'v2' ? '/api/session' : '/session';
-    const r = await fetch(`${this.base}${path}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...authHeaders(this.opts.password) },
-      body: JSON.stringify({ model: this.opts.model }),
-    });
-    if (!r.ok) throw new Error(`opencode createSession ${r.status}: ${await r.text()}`);
-    const body = (await r.json()) as { id?: string; session?: { id?: string } };
-    return body.id ?? body.session?.id ?? '';
-  }
-
-  private startSSE(): void {
-    const ctrl = new AbortController();
-    this.sseCtrl = ctrl;
-    const url = this.version === 'v2' ? `${this.base}/api/event` : `${this.base}/event`;
-    void (async () => {
-      try {
-        const r = await fetch(url, { headers: authHeaders(this.opts.password), signal: ctrl.signal });
-        if (!r.body) return;
-        await this.parseSSE(r.body);
-      } catch (e) {
-        if (!ctrl.signal.aborted) log.warn('opencode SSE error', { err: String(e) });
-      }
-    })();
-  }
-
-  private async parseSSE(body: ReadableStream<Uint8Array>): Promise<void> {
-    const reader = body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const parts = buf.split('\n\n');
-      buf = parts.pop() ?? '';
-      for (const part of parts) {
-        const dataLine = part.split('\n').find((l) => l.startsWith('data:'));
-        if (!dataLine) continue;
-        const json = dataLine.slice(5).trim();
-        if (!json) continue;
-        try {
-          this.handleSSEEvent(JSON.parse(json) as Record<string, unknown>);
-        } catch {
-          // non-JSON keepalive
-        }
-      }
-    }
-  }
-
-  /** Finalize buffered assistant text as a text.done event (clears the buffer). Mirrors the
-   *  codex adapter's accumulate-then-emit-on-boundary pattern. Idempotent when empty. */
-  private flushMessage(): void {
-    if (this.messageBuf) {
-      this.emit({ type: 'text.done', text: this.messageBuf });
-      this.messageBuf = '';
-    }
-  }
-
-  private handleSSEEvent(ev: Record<string, unknown>): void {
-    const type = ev.type as string;
-    if (!type) return;
-    // v2 events
-    if (type === 'session.next.text.delta') {
-      const text = (ev.delta as string) ?? '';
-      this.messageBuf += text;
-      this.emit({ type: 'text.delta', text });
-    } else if (type === 'session.next.text.ended') {
-      // text finalized via deltas -> flush accumulated buffer as text.done so it persists.
-      this.flushMessage();
-    } else if (type === 'session.next.tool.called') {
-      this.flushMessage(); // a tool call beginning => preceding assistant text ended
-      this.emit({
-        type: 'tool.start',
-        toolCallId: (ev.toolCallId as string) ?? randomUUID(),
-        tool: (ev.tool as string) ?? 'tool',
-        input: ev.input,
-      });
-    } else if (type === 'session.next.tool.success' || type === 'session.next.tool.failed') {
-      this.emit({
-        type: 'tool.done',
-        toolCallId: (ev.toolCallId as string) ?? '',
-        isError: type === 'session.next.tool.failed',
-      });
-    } else if (type === 'session.next.step.ended') {
-      this.flushMessage(); // safety-net: persist any unflushed assistant text before turn end
-      const u = ev as { inputTokens?: number; outputTokens?: number; cost?: number };
-      this.emit({
-        type: 'turn.completed',
-        usage: { inputTokens: u.inputTokens, outputTokens: u.outputTokens },
-        costUsd: typeof u.cost === 'number' ? u.cost : undefined,
-      });
-    } else if (type === 'permission.v2.asked' || type === 'permission.updated') {
-      this.onPermission(ev);
-    } else if (type === 'session.idle') {
-      // v1 completion signal
-      this.flushMessage(); // v1 has no text.ended; flush accumulated text at turn end
-      this.emit({ type: 'turn.completed' });
-    }
-    // v1 message.part.updated handled minimally
-    else if (type === 'message.part.updated') {
-      const part = ev.part as { type?: string; text?: string } | undefined;
-      if (part?.type === 'text' && typeof part.text === 'string') {
-        this.emit({ type: 'text.delta', text: part.text });
-      }
-    }
-  }
-
-  private onPermission(ev: Record<string, unknown>): void {
-    const permissionId = (ev.id ?? ev.permissionId) as string | undefined;
-    if (!permissionId) return;
-    const kind: ApprovalKind = 'permission';
-    const approvalId = permissionId; // reuse as our approvalId
-    this.emit({
-      type: 'approval.request',
-      approvalId,
-      kind,
-      tool: (ev.tool as string) ?? undefined,
-      input: ev.input,
-      summary: (ev.message as string) ?? `permission ${ev.tool ?? ''}`,
-      choices: [...CHOICES],
-    });
-    void new Promise<ApprovalDecision>((resolve) => {
-      this.tracker.register(approvalId, resolve);
-    });
   }
 
   async send(input: UserInput): Promise<void> {
-    if (!this.ocSessionId) throw new Error('opencode session not created');
-    // SMOKE: v1 /session/:id/prompt_async vs v2 /api/session/:id/prompt
-    const path =
-      this.version === 'v2'
-        ? `/api/session/${this.ocSessionId}/prompt`
-        : `/session/${this.ocSessionId}/prompt_async`;
-    const r = await fetch(`${this.base}${path}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...authHeaders(this.opts.password) },
-      body: JSON.stringify({ parts: [{ type: 'text', text: input.text }] }),
-    });
-    if (!r.ok) log.warn('opencode prompt failed', { status: r.status, body: await r.text() });
+    if (this.disposed) throw new Error('session disposed');
+    if (this.moyuPending) throw new Error('OpenCode session already has a Moyu turn in flight');
+    if (input.attachments?.length) throw new Error('OpenCode image input is not enabled in v0.0.4');
+    const client = await this.runtime.client();
+    const model = parseOpenCodeModel(this.modelValue);
+    this.moyuPending = true;
+    try {
+      await client.promptAsync(this.nativeSessionId, this.opts.cwd, input, model);
+    } catch (error) {
+      this.moyuPending = false;
+      throw error;
+    }
   }
 
   async interrupt(): Promise<void> {
-    if (!this.ocSessionId) return;
-    const path =
-      this.version === 'v2'
-        ? `/api/session/${this.ocSessionId}/abort`
-        : `/session/${this.ocSessionId}/abort`;
-    try {
-      await fetch(`${this.base}${path}`, { method: 'POST', headers: authHeaders(this.opts.password) });
-    } catch (e) {
-      log.warn('opencode abort failed', { err: String(e) });
+    const client = await this.runtime.client();
+    await client.abort(this.nativeSessionId, this.opts.cwd);
+    if (this.moyuPending || this.turnRunning) {
+      this.emitEvent({ type: 'turn.failed', category: 'unknown', summary: 'OpenCode turn interrupted' });
     }
+    this.moyuPending = false;
+    this.turnRunning = false;
   }
 
   async resolveApproval(approvalId: string, decision: ApprovalDecision): Promise<void> {
-    const reply = toOpencode(decision);
-    if (this.version === 'v2') {
-      // SMOKE: session.permission.reply vs POST /api/session/:id/permissions/:id
-      const path = `/api/session/${this.ocSessionId}/permissions/${approvalId}`;
-      await fetch(`${this.base}${path}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', ...authHeaders(this.opts.password) },
-        body: JSON.stringify({ reply }),
-      });
-    } else {
-      const path = `/session/${this.ocSessionId}/permissions/${approvalId}`;
-      await fetch(`${this.base}${path}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', ...authHeaders(this.opts.password) },
-        body: JSON.stringify({ response: reply }),
-      });
-    }
+    if (!this.tracker.has(approvalId)) throw new Error('approval is not pending');
+    const client = await this.runtime.client();
+    await client.replyPermission(this.nativeSessionId, approvalId, toOpencode(decision), this.opts.cwd);
     this.tracker.resolve(approvalId, decision);
   }
 
-  history(_afterSeq?: number): Promise<Message[]> {
-    return Promise.resolve([]);
+  async history(afterSeq = 0): Promise<Message[]> {
+    const client = await this.runtime.client();
+    return normalizeOpenCodeMessages(await client.listMessages(this.nativeSessionId, this.opts.cwd))
+      .filter((message) => message.seq > afterSeq);
   }
 
-  onEvent(cb: (e: AdapterEvent) => void): () => void {
+  onEvent(cb: (event: AdapterEvent) => void): () => void {
     this.emit = cb;
-    return () => {
-      if (this.emit === cb) this.emit = () => {};
-    };
+    const buffered = this.buffered;
+    this.buffered = [];
+    for (const event of buffered) cb(event);
+    return () => { if (this.emit === cb) this.emit = NOOP; };
+  }
+
+  async setModel(model?: string): Promise<void> {
+    if (this.moyuPending || this.turnRunning) throw new Error('cannot change model while a turn is running');
+    parseOpenCodeModel(model);
+    this.modelValue = model?.trim() || undefined;
   }
 
   async dispose(): Promise<void> {
-    this.tracker.clear();
-    this.sseCtrl?.abort();
-    if (this.child) {
-      try {
-        this.child.kill('SIGTERM');
-      } catch {
-        // best-effort
-      }
+    if (this.disposed) return;
+    this.unsubscribeRuntime?.();
+    this.unsubscribeRuntime = null;
+    // Cleanup must never start/re-attach a server merely to reject stale approvals.
+    const client = this.nativeSessionId && this.pendingApprovals.size
+      ? this.runtime.readyClient() : null;
+    if (client) {
+      await Promise.allSettled([...this.pendingApprovals].map((id) =>
+        client.replyPermission(this.nativeSessionId, id, 'reject', this.opts.cwd)));
     }
+    this.disposed = true;
+    this.tracker.clear();
+    this.buffered = [];
+    this.emit = NOOP;
   }
 }
